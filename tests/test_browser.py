@@ -5,6 +5,8 @@ import tempfile
 from unittest import mock
 
 import pytest
+import requests
+import requests_mock
 import setpath  # noqa:F401, must come before 'import mechanicalsoup'
 from bs4 import BeautifulSoup
 from requests.cookies import RequestsCookieJar
@@ -465,6 +467,36 @@ def test_looks_like_html_does_not_decode_whole_body():
         mechanicalsoup.Browser.add_soup(response, {'features': 'lxml'})
 
     assert response.soup is None
+
+
+def test_submit_failure_does_not_mutate_form():
+    """Browser.submit must not leave a chosen submit element or any other
+    change on the caller's form when the request fails."""
+    form_html = ('<form method="post" action="mock://example.com/post">'
+                 '<input name="field" value="original">'
+                 '<input type="submit" name="go" value="Go"></form>')
+
+    adapter = requests_mock.Adapter()
+    browser = mechanicalsoup.Browser(requests_adapters={'mock': adapter})
+    mock_get(adapter, url='mock://example.com', reply=form_html)
+    page = browser.get('mock://example.com').soup
+    form = mechanicalsoup.Form(page.form)
+
+    adapter.register_uri(
+        'POST', 'mock://example.com/post',
+        exc=requests.exceptions.ConnectionError)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        browser.submit(form, url='mock://example.com', btnName='go')
+
+    # The caller's form is untouched and can be reused as-is.
+    assert form.submit_chosen is None
+    assert form.form.input['value'] == 'original'
+
+    adapter.register_uri(
+        'POST', 'mock://example.com/post', text='Success!')
+    response = browser.submit(form, url='mock://example.com', btnName='go')
+    assert response.status_code == 200
+    assert form.submit_chosen is None
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import copy
 import tempfile
 from typing import cast
 import urllib.parse
@@ -383,11 +384,16 @@ class Browser:
         """
         if not isinstance(form, Form):
             form = Form(form)
-        submit = form.submit_chosen
+        # Work on a private copy so that a failed request cannot mutate the
+        # caller's form, in particular the submit element chosen by
+        # Form.choose_submit(). The original form is left untouched on both
+        # success and failure.
+        form_copy = copy.deepcopy(form)
+        submit = form_copy.submit_chosen
         if (submit is None) or (btnName is not None):
-            submit = form.choose_submit(btnName)
+            submit = form_copy.choose_submit(btnName)
 
-        response = self._request(form.form, url, submit, **kwargs)
+        response = self._request(form_copy.form, url, submit, **kwargs)
         return Browser.add_soup(response, self.soup_config)
 
     def launch_browser(self, soup):

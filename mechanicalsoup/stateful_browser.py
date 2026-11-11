@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from dataclasses import dataclass
 import re
 import sys
@@ -82,6 +83,23 @@ class StatefulBrowser(Browser):
         self.get_current_form = lambda: self.__state.form
         self.get_url = lambda: self.url
 
+    @contextmanager
+    def _state_transaction(self):
+        """Run a navigation as an atomic state transaction.
+
+        The current state is captured before the request. If the request
+        raises an exception, the captured state (page, URL, selected form
+        and response metadata) is put back verbatim and the exception is
+        propagated: no half-built state or object of the failed attempt
+        survives. On success, the caller commits the new state explicitly.
+        """
+        previous_state = self.__state
+        try:
+            yield
+        except BaseException:
+            self.__state = previous_state
+            raise
+
     def set_debug(self, debug):
         """Set the debug mode (off by default).
 
@@ -154,6 +172,12 @@ class StatefulBrowser(Browser):
         """Open the URL and store the Browser's state in this object.
         All arguments are forwarded to :func:`Browser.get`.
 
+        If the request raises an exception, the browser state is rolled
+        back to the state it had before the call: the previously loaded
+        page, selected form and response metadata stay available, and no
+        object of the failed attempt is retained. The exception is still
+        raised, so callers can distinguish failure from success.
+
         :return: Forwarded from :func:`Browser.get`.
         """
         if self.__verbose == 1:
@@ -162,7 +186,8 @@ class StatefulBrowser(Browser):
         elif self.__verbose >= 2:
             print(url)
 
-        resp = self.get(url, *args, **kwargs)
+        with self._state_transaction():
+            resp = self.get(url, *args, **kwargs)
         self.__state = _BrowserState(page=resp.soup, url=resp.url,
                                      request=resp.request)
         return resp
@@ -200,8 +225,9 @@ class StatefulBrowser(Browser):
                              'page is opened or low-level browser methods '
                              'were used to do so')
 
-        resp = self.session.send(old_request)
-        resp = Browser.add_soup(resp, self.soup_config)
+        with self._state_transaction():
+            resp = self.session.send(old_request)
+            resp = Browser.add_soup(resp, self.soup_config)
         self.__state = _BrowserState(page=resp.soup, url=resp.url,
                                      request=resp.request)
         return resp
@@ -310,19 +336,25 @@ class StatefulBrowser(Browser):
             browser state will remain unchanged; this is useful for forms that
             result in a download of a file, for example.
 
+        If the submission raises an exception, the browser state is rolled
+        back to its state before the call (including the selected form and
+        its field values), and the exception is propagated. No temporary
+        response or form value of the failed attempt is kept around.
+
         All other arguments are forwarded to :func:`Browser.submit`.
         """
         kwargs = self._merge_referer(**kwargs)
-        resp = Browser.submit(
-            self,
-            form=self.form,
-            url=self.url,
-            btnName=btnName,
-            **kwargs,
-        )
-        if update_state:
-            self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                         request=resp.request)
+        with self._state_transaction():
+            resp = Browser.submit(
+                self,
+                form=self.form,
+                url=self.url,
+                btnName=btnName,
+                **kwargs,
+            )
+            if update_state:
+                self.__state = _BrowserState(page=resp.soup, url=resp.url,
+                                             request=resp.request)
         return resp
 
     def list_links(self, *args, **kwargs):

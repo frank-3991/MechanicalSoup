@@ -920,5 +920,190 @@ def test_submit_error():
         browser.submit(browser.form)
 
 
+def test_open_failure_keeps_previous_state():
+    """A failed open() must not replace the working state with a
+    half-built state: the previous page, URL, form and request remain
+    available, and the failure is distinguishable from a success."""
+    url = 'mock://example.com'
+    form_html = ('<form method="post" action="mock://example.com/post">'
+                 '<input name="field" value="original"></form>')
+
+    browser, adapter = prepare_mock_browser()
+    mock_get(adapter, url=url, reply=form_html)
+    browser.open(url)
+    browser.select_form()
+    browser["field"] = "original"
+    previous_state = browser._StatefulBrowser__state
+
+    adapter.register_uri(
+        'GET', 'mock://example.com/broken',
+        exc=requests.exceptions.ConnectionError)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        browser.open('mock://example.com/broken')
+
+    # The state and its objects are untouched and still fully usable.
+    assert browser._StatefulBrowser__state is previous_state
+    assert browser.url == url
+    assert browser.page == BeautifulSoup(form_html, 'lxml')
+    assert browser.get_current_form() is previous_state.form
+    assert browser.form.form.input['value'] == 'original'
+
+
+def test_open_failure_does_not_pollute_next_operation():
+    """Objects created by a failed attempt (response, soup, request) must
+    not leak into the browser state used by the next operation."""
+    url = 'mock://example.com'
+    next_url = 'mock://example.com/next'
+
+    browser, adapter = prepare_mock_browser()
+    mock_get(adapter, url=url, reply='<p>first page</p>')
+    browser.open(url)
+
+    adapter.register_uri(
+        'GET', 'mock://example.com/broken',
+        exc=requests.exceptions.Timeout)
+    with pytest.raises(requests.exceptions.Timeout):
+        browser.open('mock://example.com/broken')
+
+    mock_get(adapter, url=next_url,
+             reply='<a href="mock://example.com">link</a>')
+    resp = browser.open(next_url)
+    assert resp.status_code == 200
+    assert browser.url == next_url
+    assert browser.page == BeautifulSoup(
+        '<a href="mock://example.com">link</a>', 'lxml')
+    assert browser._StatefulBrowser__state.request is resp.request
+
+
+def test_open_redirect_keeps_state_consistent():
+    """On a successful redirect, the page, URL and response metadata must
+    describe the final response (not the intermediate one)."""
+    start_url = 'mock://example.com/start'
+    final_url = 'mock://example.com/final'
+    final_html = '<html><body><p>final page</p></body></html>'
+
+    browser, adapter = prepare_mock_browser()
+    adapter.register_uri(
+        'GET', start_url, status_code=302,
+        headers={'Location': final_url})
+    mock_get(adapter, url=final_url, reply=final_html)
+
+    resp = browser.open(start_url)
+
+    assert resp.status_code == 200
+    assert resp.url == final_url
+    assert resp.request.url == final_url
+    assert browser.url == final_url
+    assert browser.page == BeautifulSoup(final_html, 'lxml')
+    # Metadata exposed by the browser matches the returned response.
+    assert browser._StatefulBrowser__state.request is resp.request
+
+
+def test_submit_selected_failure_keeps_form_and_page():
+    """A form submission whose request fails must leave the selected
+    form, including its field values, and the current page intact."""
+    url = 'mock://example.com'
+    form_html = ('<form method="post" action="mock://example.com/post">'
+                 '<input name="field" value="">'
+                 '<input type="submit" name="go" value="Go"></form>')
+
+    browser, adapter = prepare_mock_browser()
+    mock_get(adapter, url=url, reply=form_html)
+    browser.open(url)
+    browser.select_form()
+    browser["field"] = "filled value"
+    previous_state = browser._StatefulBrowser__state
+    page_before_failure = browser.page
+
+    adapter.register_uri(
+        'POST', 'mock://example.com/post',
+        exc=requests.exceptions.ConnectionError)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        browser.submit_selected()
+
+    assert browser._StatefulBrowser__state is previous_state
+    assert browser.url == url
+    assert browser.page is page_before_failure
+    assert browser.form.form.input['value'] == 'filled value'
+    # The same form can be submitted again successfully afterwards.
+    adapter.register_uri(
+        'POST', 'mock://example.com/post',
+        text='<p>accepted</p>',
+        headers={'Content-Type': 'text/html'})
+    resp = browser.submit_selected()
+    assert resp.status_code == 200
+    assert browser.url == 'mock://example.com/post'
+    assert browser.page == BeautifulSoup('<p>accepted</p>', 'lxml')
+
+
+def test_submit_failure_does_not_change_chosen_submit():
+    """Choosing a submit control for a failed submission must not leave
+    the choice recorded on the live form for later operations."""
+    browser, url = setup_mock_browser(
+        expected_post=[('text', 'Setting some text!'),
+                       ('comment', 'Selecting an input submit'),
+                       ('diff', 'Review Changes')])
+    browser.open(url)
+    browser.select_form('#choose-submit-form')
+    browser['text'] = 'Setting some text!'
+    browser['comment'] = 'Selecting an input submit'
+    assert browser.form.submit_chosen is None
+
+    adapter = browser.session.get_adapter('mock://')
+    adapter.register_uri(
+        'POST', url + '/post',
+        exc=requests.exceptions.ConnectionError)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        browser.submit_selected(btnName='diff')
+
+    assert browser.form.submit_chosen is None
+
+
+def test_refresh_failure_keeps_previous_state():
+    """A failed refresh() must leave the current page and form in place."""
+    url = 'mock://example.com'
+    form_html = '<form><input name="field" value="kept"></form>'
+
+    browser, adapter = prepare_mock_browser()
+    mock_get(adapter, url=url, reply=form_html)
+    browser.open(url)
+    browser.select_form()
+    previous_state = browser._StatefulBrowser__state
+
+    adapter.register_uri(
+        'GET', url,
+        exc=requests.exceptions.ConnectionError)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        browser.refresh()
+
+    assert browser._StatefulBrowser__state is previous_state
+    assert browser.url == url
+    assert browser.page == BeautifulSoup(form_html, 'lxml')
+    assert browser.form.form.input['value'] == 'kept'
+
+
+def test_failed_follow_link_keeps_previous_state():
+    """follow_link() routes through open(): a failing request behind a
+    link must leave the originating page and form available."""
+    url = 'mock://example.com'
+    broken_url = 'mock://example.com/broken'
+    page_html = f'<a href="{broken_url}">broken</a>'
+
+    browser, adapter = prepare_mock_browser()
+    mock_get(adapter, url=url, reply=page_html)
+    browser.open(url)
+    previous_state = browser._StatefulBrowser__state
+
+    adapter.register_uri(
+        'GET', broken_url,
+        exc=requests.exceptions.ConnectionError)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        browser.follow_link()
+
+    assert browser._StatefulBrowser__state is previous_state
+    assert browser.url == url
+    assert browser.page == BeautifulSoup(page_html, 'lxml')
+
+
 if __name__ == '__main__':
     pytest.main(sys.argv)
