@@ -1,9 +1,10 @@
 import sys
+from urllib.parse import parse_qsl, urlparse
 
 import bs4
 import pytest
 import setpath  # noqa:F401, must come before 'import mechanicalsoup'
-from utils import setup_mock_browser
+from utils import mock_get, prepare_mock_browser, setup_mock_browser
 
 import mechanicalsoup
 
@@ -546,6 +547,230 @@ def test_option_without_value(fail, selected, expected_post):
 
         res = browser.submit_selected()
         assert res.status_code == 200 and res.text == 'Success!'
+
+
+def request_target(request):
+    """Return the scheme://host/path part of a captured request URL."""
+    parts = urlparse(request.url)
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def request_fields(request):
+    """Return the ordered (name, value) fields of a captured request,
+    taken from the query string (GET forms) and from the body (POST
+    forms)."""
+    query = urlparse(request.url).query
+    return parse_qsl(query) + parse_qsl(request.text or "")
+
+
+def assert_submission(request, method, target, fields):
+    """Check a captured request, with failure messages that identify
+    whether the mismatch is in the HTTP method, the submission target,
+    or the collected fields."""
+    assert request.method == method, (
+        f"submission method: expected {method}, got {request.method} "
+        f"for {request.url}")
+    actual_target = request_target(request)
+    assert actual_target == target, (
+        f"submission target: expected {target}, got {actual_target}")
+    actual_fields = request_fields(request)
+    assert actual_fields == fields, (
+        f"field collection: expected {fields}, got {actual_fields}")
+
+
+def mock_post_reply(mock, url, marker):
+    """Register a POST endpoint that replies with an identifiable page."""
+    mock.register_uri(
+        'POST', url,
+        text=f'<html><body>{marker}</body></html>',
+        headers={'Content-Type': 'text/html'})
+
+
+formaction_form = '''
+<html>
+  <body>
+    <form id="formaction-form" method="post" action="mock://form.com/default">
+      <input type="hidden" name="box" value="1" />
+      <input type="checkbox" name="box" value="2" checked="checked" />
+      <input type="hidden" name="box" value="0" />
+      <select name="multi" multiple="multiple">
+        <option value="a" selected="selected">A</option>
+        <option value="b" selected="selected">B</option>
+      </select>
+      <button type="submit" name="go" value="default">Default</button>
+      <button type="submit" name="go" value="override"
+              formaction="mock://form.com/override">Override</button>
+    </form>
+  </body>
+</html>
+'''
+
+# Same-name fields and multi-value fields, in page order. The submit
+# control is appended last, at its position in the form.
+formaction_base_fields = [
+    ('box', '1'),
+    ('box', '2'),
+    ('box', '0'),
+    ('multi', 'a'),
+    ('multi', 'b'),
+]
+
+
+@pytest.mark.parametrize("submit_value, target", [
+    pytest.param('default', 'mock://form.com/default',
+                 id='default form action'),
+    pytest.param('override', 'mock://form.com/override',
+                 id='button formaction override'),
+])
+def test_submit_button_formaction(submit_value, target):
+    """A submit button's formaction overrides the form's action, while
+    the collected fields (including same-name and multi-value fields)
+    keep the same order, and the browser state reflects the endpoint
+    that actually answered."""
+    url = 'mock://form.com'
+    browser, mock = prepare_mock_browser()
+    mock_get(mock, url, formaction_form)
+    mock_post_reply(mock, 'mock://form.com/default', 'default target')
+    mock_post_reply(mock, 'mock://form.com/override', 'override target')
+
+    browser.open(url)
+    form = browser.select_form('#formaction-form')
+    button = form.form.select_one(f'button[value="{submit_value}"]')
+    assert button is not None
+    form.choose_submit(button)
+    res = browser.submit_selected()
+
+    assert res.status_code == 200, (
+        f"response status: expected 200, got {res.status_code}")
+    # One GET (page open) followed by one POST (form submission).
+    assert len(mock.request_history) == 2
+    request = mock.request_history[-1]
+    assert_submission(request, 'POST', target,
+                      formaction_base_fields + [('go', submit_value)])
+
+    # The final page state comes from the endpoint that was submitted to.
+    marker = 'default target' if submit_value == 'default' \
+        else 'override target'
+    assert browser.url == target, (
+        f"final page URL: expected {target}, got {browser.url}")
+    assert marker in browser.page.get_text(), (
+        f"final page content: expected {marker!r} in page")
+
+
+disabled_controls_form = '''
+<html>
+  <body>
+    <form id="disabled-form" method="{method}"
+          action="http://form.test/submit">
+      <input type="text" name="active" value="yes" />
+      <input type="text" name="disabled_field" value="no"
+             disabled="disabled" />
+      <fieldset disabled="disabled">
+        <input type="text" name="in_disabled_fieldset" value="no" />
+      </fieldset>
+      <input type="submit" name="go" value="Go" />
+      <input type="submit" name="disabled_submit" value="No"
+             disabled="disabled" />
+    </form>
+  </body>
+</html>
+'''
+
+
+@pytest.mark.parametrize("method", [
+    pytest.param('get', id='GET form'),
+    pytest.param('post', id='POST form'),
+])
+def test_submit_disabled_controls(method):
+    """Disabled controls (including controls inside a disabled fieldset)
+    are never submitted, whatever the submission method. GET forms send
+    the fields in the query string, POST forms in the request body."""
+    # Use the http scheme (mocked locally) because requests drops the
+    # query string of non-http URLs, which would discard GET parameters.
+    # The 'http://' mount prefix replaces the session's default adapter.
+    url = 'http://form.test'
+    browser, mock = prepare_mock_browser(scheme='http://')
+    mock_get(mock, url, disabled_controls_form.format(method=method))
+    mock_post_reply(mock, 'http://form.test/submit', 'submitted')
+    mock_get(mock, 'http://form.test/submit',
+             '<html><body>submitted</body></html>')
+
+    browser.open(url)
+    browser.select_form('#disabled-form')
+    res = browser.submit_selected(btnName='go')
+
+    assert res.status_code == 200, (
+        f"response status: expected 200, got {res.status_code}")
+    assert len(mock.request_history) == 2
+    request = mock.request_history[-1]
+    assert_submission(request, method.upper(), 'http://form.test/submit',
+                      [('active', 'yes'), ('go', 'Go')])
+    # No disabled control leaked into the request, in either location.
+    assert 'disabled' not in urlparse(request.url).query
+    assert 'disabled' not in (request.text or "")
+    assert browser.url.startswith('http://form.test/submit'), (
+        f"final page URL: unexpected {browser.url}")
+
+
+flaky_form = '''
+<html>
+  <body>
+    <form id="flaky-form" method="post" action="mock://form.com/flaky">
+      <input type="hidden" name="box" value="1" />
+      <input type="checkbox" name="box" value="2" checked="checked" />
+      <input type="text" name="comment" value="" />
+      <input type="submit" name="save" value="Save" />
+    </form>
+  </body>
+</html>
+'''
+
+
+def test_failed_submit_does_not_corrupt_form():
+    """A failed submission must not mutate the form: retrying the same
+    form afterwards sends exactly the same fields, in the same order,
+    and the failed attempt leaves the browser state untouched."""
+    url = 'mock://form.com'
+    browser, mock = prepare_mock_browser()
+    mock_get(mock, url, flaky_form)
+    mock.register_uri('POST', 'mock://form.com/flaky', [
+        {'text': '<html><body>error</body></html>', 'status_code': 500},
+        {'text': '<html><body>recovered</body></html>',
+         'status_code': 200},
+    ])
+
+    browser.open(url)
+    browser.select_form('#flaky-form')
+    browser['comment'] = 'first attempt'
+
+    # Keep the form selected when the submission fails, so that the
+    # same form can be retried.
+    res_fail = browser.submit_selected(update_state=False)
+    assert res_fail.status_code == 500, (
+        f"response status: expected 500, got {res_fail.status_code}")
+    assert browser.url == url, (
+        f"failed submission moved the browser to {browser.url}")
+
+    res_ok = browser.submit_selected()
+    assert res_ok.status_code == 200, (
+        f"response status: expected 200, got {res_ok.status_code}")
+
+    expected_fields = [
+        ('box', '1'),
+        ('box', '2'),
+        ('comment', 'first attempt'),
+        ('save', 'Save'),
+    ]
+    posts = [r for r in mock.request_history if r.method == 'POST']
+    assert len(posts) == 2
+    for request in posts:
+        assert_submission(request, 'POST', 'mock://form.com/flaky',
+                          expected_fields)
+
+    assert browser.url == 'mock://form.com/flaky', (
+        f"final page URL: unexpected {browser.url}")
+    assert 'recovered' in browser.page.get_text(), (
+        "final page content: expected 'recovered' in page")
 
 
 if __name__ == '__main__':
