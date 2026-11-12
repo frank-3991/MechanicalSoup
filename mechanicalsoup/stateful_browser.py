@@ -50,6 +50,11 @@ class StatefulBrowser(Browser):
     :param raise_on_404: If True, raise :class:`LinkNotFoundError`
         when visiting a page triggers a 404 Not Found error.
     :param user_agent: Set the user agent header to this value.
+    :param allow_cross_origin_credentials: If False, do not send
+        ``Authorization`` or explicit ``Cookie`` headers from the original
+        origin to another origin during a redirect. CookieJar cookies are
+        also filtered by scheme, host and port. Set this to True only when
+        the redirect target is trusted.
 
     All arguments are forwarded to :func:`Browser`.
 

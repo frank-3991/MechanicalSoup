@@ -16,6 +16,12 @@ Version 1.5 (in development)
 * ``StatefulBrowser.links`` now raises an explanatory ``AttributeError`` when
   no page is loaded, instead of failing inside BeautifulSoup.
 
+* Cross-origin redirects no longer send the original origin's
+  ``Authorization`` or explicit ``Cookie`` header by default. Cookies from the
+  CookieJar are also limited to the redirect's scheme, host and port. The
+  previous behavior can be enabled explicitly with
+  ``allow_cross_origin_credentials=True`` when constructing a browser.
+
 Version 1.4
 ===========
 

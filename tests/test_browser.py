@@ -1,16 +1,20 @@
 from contextlib import nullcontext
+from http.cookiejar import Cookie, CookieJar
 import os
 import sys
 import tempfile
 from unittest import mock
 
 import pytest
+import requests
+import requests_mock
 import setpath  # noqa:F401, must come before 'import mechanicalsoup'
 from bs4 import BeautifulSoup
 from requests.cookies import RequestsCookieJar
 from utils import mock_get, prepare_mock_browser
 
 import mechanicalsoup
+from mechanicalsoup.session import BoundaryAwareSession
 
 
 def test_default_soup_config_not_shared_between_browsers():
@@ -365,6 +369,443 @@ def test_get_cookiejar(httpbin):
     jar = browser.get_cookiejar()
     assert jar.get('k1') == 'v1'
     assert jar.get('k2') == 'v2'
+
+
+def _make_cookie(name, value, domain, path="/"):
+    return Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=domain,
+        domain_specified=True,
+        domain_initial_dot=False,
+        path=path,
+        path_specified=True,
+        secure=False,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={},
+        rfc2109=False,
+    )
+
+
+def _set_cookie_response(cookie):
+    def callback(request, context):
+        context.cookies.set_cookie(cookie)
+        return ""
+
+    return callback
+
+
+def test_redirect_keeps_credentials_for_same_origin():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    browser.session.cookies.set("session", "a-value", domain="a.test")
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "/end"},
+        text=_set_cookie_response(
+            _make_cookie("new", "from-a", "a.test")
+        ),
+    )
+    adapter.register_uri("GET", "http://a.test/end", text="done")
+
+    response = browser.get(
+        "http://a.test/start",
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "session=a-value",
+        },
+    )
+
+    redirect_request = adapter.request_history[1]
+    assert response.url == "http://a.test/end"
+    assert redirect_request.headers["Cookie"] == (
+        "session=a-value; new=from-a"
+    )
+    assert redirect_request.headers["Authorization"] == "Bearer secret"
+    assert browser.session.cookies.get("new", domain="a.test") == "from-a"
+
+
+def test_redirect_strips_credentials_for_cross_origin():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    browser.session.cookies.set("session", "a-value", domain="a.test")
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/end"},
+    )
+    adapter.register_uri(
+        "GET",
+        "http://b.test/end",
+        text=_set_cookie_response(
+            _make_cookie("session", "b-value", "b.test")
+        ),
+    )
+
+    response = browser.get(
+        "http://a.test/start",
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "session=a-value",
+        },
+    )
+
+    redirect_request = adapter.request_history[1]
+    assert response.url == "http://b.test/end"
+    assert "Cookie" not in redirect_request.headers
+    assert "Authorization" not in redirect_request.headers
+    assert browser.session.cookies.get("session", domain="a.test") == "a-value"
+    assert browser.session.cookies.get("session", domain="b.test") == "b-value"
+
+
+def test_redirect_boundary_applies_to_provided_session():
+    session = requests.Session()
+    browser = mechanicalsoup.Browser(session=session)
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/end"},
+    )
+    adapter.register_uri("GET", "http://b.test/end", text="done")
+
+    browser.get(
+        "http://a.test/start",
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert isinstance(browser.session, BoundaryAwareSession)
+    assert "Authorization" not in adapter.request_history[1].headers
+
+
+def test_redirect_strips_cookies_for_cross_port_origin():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    browser.session.cookies.set("session", "a-value", domain="a.test")
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://a.test:8080/end"},
+    )
+    adapter.register_uri("GET", "http://a.test:8080/end", text="done")
+
+    response = browser.get("http://a.test/start")
+
+    assert response.url == "http://a.test:8080/end"
+    assert "Cookie" not in adapter.request_history[1].headers
+
+
+def test_redirect_strips_cookies_for_cross_scheme_origin():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    browser.session.mount("https://", adapter)
+    browser.session.cookies.set("session", "a-value", domain="a.test")
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "https://a.test/end"},
+    )
+    adapter.register_uri("GET", "https://a.test/end", text="done")
+
+    response = browser.get("http://a.test/start")
+
+    assert response.url == "https://a.test/end"
+    assert "Cookie" not in adapter.request_history[1].headers
+
+
+def test_redirect_keeps_cookies_for_same_scheme_subdomain():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    browser.session.cookies.set("session", "a-value", domain="a.test")
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://sub.a.test/end"},
+    )
+    adapter.register_uri("GET", "http://sub.a.test/end", text="done")
+
+    response = browser.get("http://a.test/start")
+
+    assert response.url == "http://sub.a.test/end"
+    assert adapter.request_history[1].headers["Cookie"] == "session=a-value"
+
+
+def test_redirect_credential_scope_when_returning_to_origin():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    browser.session.cookies.set_cookie(
+        _make_cookie("cookie", "a-value", "a.test")
+    )
+    browser.session.cookies.set_cookie(
+        _make_cookie("cookie", "b-value", "b.test")
+    )
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/bounce"},
+    )
+    adapter.register_uri(
+        "GET",
+        "http://b.test/bounce",
+        status_code=302,
+        headers={"Location": "http://a.test/return"},
+    )
+    adapter.register_uri("GET", "http://a.test/return", text="done")
+
+    response = browser.get("http://a.test/start")
+
+    request_cookies = [
+        request.headers.get("Cookie")
+        for request in adapter.request_history
+    ]
+    assert response.url == "http://a.test/return"
+    assert request_cookies == [
+        "cookie=a-value",
+        "cookie=b-value",
+        "cookie=a-value",
+    ]
+
+
+def test_redirect_does_not_resend_explicit_cookie_after_returning():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/bounce"},
+    )
+    adapter.register_uri(
+        "GET",
+        "http://b.test/bounce",
+        status_code=302,
+        headers={"Location": "http://a.test/return"},
+    )
+    adapter.register_uri("GET", "http://a.test/return", text="done")
+
+    response = browser.get(
+        "http://a.test/start",
+        headers={"Cookie": "session=a-value"},
+    )
+
+    request_cookies = [
+        request.headers.get("Cookie")
+        for request in adapter.request_history
+    ]
+    assert response.url == "http://a.test/return"
+    assert request_cookies == [
+        "session=a-value",
+        None,
+        None,
+    ]
+
+
+def test_redirect_failure_rolls_back_session_cookies():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    browser.session.cookies.set("existing", "value", domain="a.test")
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/fail"},
+        text=_set_cookie_response(
+            _make_cookie("partial", "value", "a.test")
+        ),
+    )
+    adapter.register_uri(
+        "GET",
+        "http://b.test/fail",
+        text=lambda request, context: (_ for _ in ()).throw(
+            RuntimeError("redirect failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="redirect failed"):
+        browser.get("http://a.test/start")
+
+    assert browser.session.cookies.get("existing", domain="a.test") == "value"
+    assert browser.session.cookies.get("partial", domain="a.test") is None
+
+
+def test_redirect_failure_rolls_back_cross_origin_cookies():
+    browser = mechanicalsoup.Browser()
+
+    class FailingAdapter(requests_mock.Adapter):
+        def send(self, request, **kwargs):
+            if request.url == "http://b.test/fail":
+                requests_mock.create_response(
+                    request,
+                    status_code=200,
+                    text="done",
+                    cookies={
+                        "partial": "b-value",
+                    },
+                )
+                raise RuntimeError("redirect failed")
+            return super().send(request, **kwargs)
+
+    adapter = FailingAdapter()
+    browser.session.mount("http://", adapter)
+
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/fail"},
+    )
+    adapter.register_uri("GET", "http://b.test/fail", text="done")
+
+    with pytest.raises(RuntimeError, match="redirect failed"):
+        browser.get("http://a.test/start")
+
+    assert browser.session.cookies.get(
+        "partial",
+        domain="b.test",
+    ) is None
+
+
+def test_redirect_keeps_custom_cookiejar_type():
+    cookiejar = CookieJar()
+    cookiejar.set_cookie(_make_cookie("session", "a-value", "a.test"))
+    session = requests.Session()
+    session.cookies = cookiejar
+    browser = mechanicalsoup.Browser(session=session)
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "/end"},
+    )
+    adapter.register_uri("GET", "http://a.test/end", text="done")
+
+    response = browser.get("http://a.test/start")
+
+    assert response.url == "http://a.test/end"
+    assert browser.session.cookies is cookiejar
+    assert isinstance(browser.session.cookies, CookieJar)
+
+
+def test_redirect_without_credentials_keeps_ordinary_behavior():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/end"},
+    )
+    adapter.register_uri("GET", "http://b.test/end", text="done")
+
+    response = browser.get("http://a.test/start")
+
+    assert response.url == "http://b.test/end"
+    assert "Cookie" not in adapter.request_history[1].headers
+    assert "Authorization" not in adapter.request_history[1].headers
+    assert len(browser.session.cookies) == 0
+
+
+def test_redirect_allows_cross_origin_credentials_when_configured():
+    browser = mechanicalsoup.Browser(
+        allow_cross_origin_credentials=True
+    )
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/end"},
+    )
+    adapter.register_uri("GET", "http://b.test/end", text="done")
+
+    response = browser.get(
+        "http://a.test/start",
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "session=a-value",
+        },
+    )
+
+    redirect_request = adapter.request_history[1]
+    assert response.url == "http://b.test/end"
+    assert redirect_request.headers["Authorization"] == "Bearer secret"
+    assert redirect_request.headers["Cookie"] == "session=a-value"
+
+
+def test_redirect_keeps_cookiejar_scope_with_cross_origin_configuration():
+    browser = mechanicalsoup.Browser(
+        allow_cross_origin_credentials=True
+    )
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    browser.session.cookies.set("session", "a-value", domain="a.test")
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/end"},
+    )
+    adapter.register_uri("GET", "http://b.test/end", text="done")
+
+    response = browser.get("http://a.test/start")
+
+    assert response.url == "http://b.test/end"
+    assert "Cookie" not in adapter.request_history[1].headers
+
+
+def test_redirect_boundary_applies_to_direct_session_send():
+    browser = mechanicalsoup.Browser()
+    adapter = requests_mock.Adapter()
+    browser.session.mount("http://", adapter)
+    adapter.register_uri(
+        "GET",
+        "http://a.test/start",
+        status_code=302,
+        headers={"Location": "http://b.test/end"},
+    )
+    adapter.register_uri("GET", "http://b.test/end", text="done")
+    request = browser.session.prepare_request(
+        requests.Request(
+            "GET",
+            "http://a.test/start",
+            headers={
+                "Authorization": "Bearer secret",
+                "Cookie": "session=a-value",
+            },
+        )
+    )
+
+    browser.session.send(request)
+
+    assert "Cookie" not in adapter.request_history[1].headers
+    assert "Authorization" not in adapter.request_history[1].headers
 
 
 def test_post(httpbin):

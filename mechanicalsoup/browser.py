@@ -13,6 +13,7 @@ import requests
 
 from .__version__ import __title__, __version__
 from .form import Form
+from .session import BoundaryAwareSession, wrap_session
 from .utils import LinkNotFoundError, is_disabled, is_multipart_file_upload
 
 
@@ -50,6 +51,11 @@ class Browser:
     :param raise_on_404: If True, raise :class:`LinkNotFoundError`
         when visiting a page triggers a 404 Not Found error.
     :param user_agent: Set the user agent header to this value.
+    :param allow_cross_origin_credentials: If False, do not send
+        ``Authorization`` or explicit ``Cookie`` headers from the original
+        origin to another origin during a redirect. CookieJar cookies are
+        also filtered by scheme, host and port. Set this to True only when
+        the redirect target is trusted.
 
     """
     def __init__(
@@ -59,9 +65,20 @@ class Browser:
         requests_adapters=None,
         raise_on_404=False,
         user_agent=None,
+        allow_cross_origin_credentials=False,
     ):
         self.raise_on_404 = raise_on_404
-        self.session = session or requests.Session()
+        provided_session = session or BoundaryAwareSession(
+            allow_cross_origin_credentials=allow_cross_origin_credentials
+        )
+        self.session = wrap_session(
+            provided_session,
+            allow_cross_origin_credentials,
+        )
+        if isinstance(self.session, BoundaryAwareSession):
+            self.session.allow_cross_origin_credentials = (
+                allow_cross_origin_credentials
+            )
 
         self._finalize = weakref.finalize(self.session, self.close)
 
