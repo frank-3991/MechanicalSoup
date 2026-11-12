@@ -1,10 +1,13 @@
 from contextlib import nullcontext
+import io
 import os
 import sys
 import tempfile
 from unittest import mock
 
 import pytest
+import requests
+import requests_mock
 import setpath  # noqa:F401, must come before 'import mechanicalsoup'
 from bs4 import BeautifulSoup
 from requests.cookies import RequestsCookieJar
@@ -465,6 +468,252 @@ def test_looks_like_html_does_not_decode_whole_body():
         mechanicalsoup.Browser.add_soup(response, {'features': 'lxml'})
 
     assert response.soup is None
+
+
+class NonSeekableStream(io.BytesIO):
+    """A readable stream that cannot be rewound, e.g. a network pipe."""
+    def seekable(self):
+        return False
+
+    def seek(self, *args, **kwargs):
+        raise io.UnsupportedOperation("not seekable")
+
+    def tell(self):
+        raise io.UnsupportedOperation("not seekable")
+
+
+upload_form_template = """
+<form method="post" action="mock://form.com/post"
+      enctype="multipart/form-data">
+  <input name="customer" value="Philip J. Fry" />
+  <input name="pic" type="file" />
+</form>
+"""
+
+
+def prepare_upload_form(file_value):
+    form = BeautifulSoup(upload_form_template, "lxml").form
+    form.find("input", {"name": "pic"})["value"] = file_value
+    return form
+
+
+def prepare_upload_browser():
+    """A plain Browser whose requests are handled by a mock adapter."""
+    adapter = requests_mock.Adapter()
+    browser = mechanicalsoup.Browser(requests_adapters={"mock": adapter})
+    return browser, adapter
+
+
+def test_upload_retry_replayable_stream():
+    """A seekable file input is rewound and resent in full on retry."""
+    browser, adapter = prepare_upload_browser()
+    url = "mock://form.com/post"
+    adapter.register_uri(
+        "POST", url,
+        [{"exc": requests.exceptions.ConnectionError},
+         {"text": "Success!", "status_code": 200}])
+
+    content = b"file content to upload"
+    form = prepare_upload_form(io.BytesIO(content))
+    response = browser.submit(form, retries=1)
+
+    assert response.status_code == 200
+    assert len(adapter.request_history) == 2
+    # Each attempt carries the current form fields and the full file
+    # content: no empty body and no duplicated bytes on the retry.
+    for request in adapter.request_history:
+        assert b'name="customer"' in request.body
+        assert b"Philip J. Fry" in request.body
+        assert request.body.count(content) == 1
+
+
+def test_upload_retry_partially_consumed_stream():
+    """A seekable stream is replayed from its initial position, even if
+    the upload started mid-stream: the retry sends the same bytes as the
+    first attempt, not the whole stream and not an empty body."""
+    browser, adapter = prepare_upload_browser()
+    url = "mock://form.com/post"
+    adapter.register_uri(
+        "POST", url,
+        [{"exc": requests.exceptions.ConnectionError},
+         {"text": "Success!", "status_code": 200}])
+
+    stream = io.BytesIO(b"prefix:suffix")
+    stream.seek(7)  # upload starts at "suffix"
+    form = prepare_upload_form(stream)
+    response = browser.submit(form, retries=1)
+
+    assert response.status_code == 200
+    assert len(adapter.request_history) == 2
+    for request in adapter.request_history:
+        assert b"suffix" in request.body
+        assert b"prefix" not in request.body
+
+
+def test_upload_retry_non_replayable_stream_fails():
+    """A non-seekable stream cannot be replayed: the retry fails
+    explicitly instead of sending empty or duplicated content."""
+    browser, adapter = prepare_upload_browser()
+    url = "mock://form.com/post"
+    adapter.register_uri(
+        "POST", url,
+        [{"exc": requests.exceptions.ConnectionError},
+         {"text": "Success!", "status_code": 200}])
+
+    form = prepare_upload_form(NonSeekableStream(b"one-shot content"))
+    with pytest.raises(mechanicalsoup.UploadNotReplayableError):
+        browser.submit(form, retries=1)
+
+    # Only the first attempt was sent; the retry never hit the network.
+    assert len(adapter.request_history) == 1
+    assert b"one-shot content" in adapter.request_history[0].body
+
+
+def test_upload_no_retry_keeps_one_shot_behavior():
+    """Without retries, a non-replayable stream is uploaded normally."""
+    browser, adapter = prepare_upload_browser()
+    url = "mock://form.com/post"
+    adapter.register_uri("POST", url, text="Success!")
+
+    form = prepare_upload_form(NonSeekableStream(b"one-shot content"))
+    response = browser.submit(form)
+
+    assert response.status_code == 200
+    assert len(adapter.request_history) == 1
+    assert b"one-shot content" in adapter.request_history[0].body
+
+
+def make_response(status_code, content=b""):
+    response = requests.Response()
+    response.status_code = status_code
+    response.headers["Content-Type"] = "text/plain"
+    response._content = content
+    response.close = mock.Mock()
+    return response
+
+
+def test_upload_retry_on_status_closes_failed_response():
+    """On a retryable status, the failed response is closed before
+    retrying; the final response is returned to the caller unclosed."""
+    browser = mechanicalsoup.Browser()
+    resp_503 = make_response(503, b"try again later")
+    resp_200 = make_response(200, b"ok")
+    browser.session.request = mock.Mock(side_effect=[resp_503, resp_200])
+
+    form = prepare_upload_form(io.BytesIO(b"content"))
+    response = browser.submit(form, retries=1, retry_statuses=(503,))
+
+    assert response is resp_200
+    resp_503.close.assert_called_once_with()
+    resp_200.close.assert_not_called()
+    # Both attempts were built from the same form fields.
+    assert browser.session.request.call_count == 2
+    for call in browser.session.request.call_args_list:
+        assert ("customer", "Philip J. Fry") in call.kwargs["data"]
+
+
+def test_upload_retry_exhausted_returns_last_response():
+    """When retries are exhausted on a retryable status, the last
+    response is returned (and left open), as in one-shot behavior."""
+    browser = mechanicalsoup.Browser()
+    responses = [make_response(503) for _ in range(3)]
+    browser.session.request = mock.Mock(side_effect=responses)
+
+    form = prepare_upload_form(io.BytesIO(b"content"))
+    response = browser.submit(form, retries=2, retry_statuses=(503,))
+
+    assert response is responses[-1]
+    assert browser.session.request.call_count == 3
+    for earlier in responses[:-1]:
+        earlier.close.assert_called_once_with()
+    responses[-1].close.assert_not_called()
+
+
+def test_upload_retry_exhausted_reraises_network_error():
+    """When retries are exhausted on network errors, the last error
+    propagates, and the browser stays usable for new requests."""
+    browser, adapter = prepare_upload_browser()
+    url = "mock://form.com/post"
+    adapter.register_uri(
+        "POST", url,
+        [{"exc": requests.exceptions.ConnectionError},
+         {"exc": requests.exceptions.ConnectionError}])
+
+    form = prepare_upload_form(io.BytesIO(b"content"))
+    with pytest.raises(requests.exceptions.ConnectionError):
+        browser.submit(form, retries=1)
+    assert len(adapter.request_history) == 2
+
+    # The same browser remains usable: the failed attempts left no
+    # stale stream, response, or state behind to pollute new requests.
+    adapter.register_uri("POST", url, text="Success!")
+    form = prepare_upload_form(io.BytesIO(b"new content"))
+    response = browser.submit(form)
+    assert response.status_code == 200
+    assert len(adapter.request_history) == 3
+    last_body = adapter.request_history[-1].body
+    assert b"new content" in last_body
+    assert b"new content" != b"content"
+
+
+def test_failed_upload_does_not_pollute_next_request():
+    """After an upload fails, a new upload with the same browser sends
+    only the new stream's content."""
+    browser, adapter = prepare_upload_browser()
+    url = "mock://form.com/post"
+    adapter.register_uri(
+        "POST", url,
+        [{"exc": requests.exceptions.ConnectionError},
+         {"text": "Success!", "status_code": 200}])
+
+    old_stream = NonSeekableStream(b"old content")
+    form = prepare_upload_form(old_stream)
+    with pytest.raises(mechanicalsoup.UploadNotReplayableError):
+        browser.submit(form, retries=1)
+
+    form = prepare_upload_form(io.BytesIO(b"new content"))
+    response = browser.submit(form)
+
+    assert response.status_code == 200
+    assert len(adapter.request_history) == 2
+    new_body = adapter.request_history[-1].body
+    assert b"new content" in new_body
+    assert b"old content" not in new_body
+
+
+def test_upload_retry_closed_stream_fails():
+    """A stream closed between attempts cannot be replayed."""
+    browser, adapter = prepare_upload_browser()
+    url = "mock://form.com/post"
+    adapter.register_uri(
+        "POST", url,
+        [{"exc": requests.exceptions.ConnectionError},
+         {"text": "Success!", "status_code": 200}])
+
+    stream = io.BytesIO(b"content")
+    form = prepare_upload_form(stream)
+
+    original_request = browser.session.request
+
+    def close_stream_on_failure(**kwargs):
+        try:
+            return original_request(**kwargs)
+        finally:
+            stream.close()
+
+    browser.session.request = mock.Mock(side_effect=close_stream_on_failure)
+    # First (and only) attempt fails and the stream gets closed; the
+    # retry must fail explicitly rather than send anything.
+    with pytest.raises(mechanicalsoup.UploadNotReplayableError):
+        browser.submit(form, retries=1)
+    assert len(adapter.request_history) == 1
+
+
+def test_upload_retry_negative_retries_rejected():
+    browser = mechanicalsoup.Browser()
+    form = prepare_upload_form(io.BytesIO(b"content"))
+    with pytest.raises(ValueError):
+        browser.submit(form, retries=-1)
 
 
 if __name__ == '__main__':

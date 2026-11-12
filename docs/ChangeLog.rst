@@ -5,6 +5,15 @@ Release Notes
 Version 1.5 (in development)
 ============================
 
+* ``Browser.submit`` now accepts ``retries`` and ``retry_statuses`` to
+  resend a failed form submission. A file upload is retried only when
+  every file input can be replayed exactly (seekable streams are
+  rewound to their initial position); otherwise the retry fails
+  explicitly with the new :class:`~mechanicalsoup.UploadNotReplayableError`
+  instead of sending empty or duplicated bytes. Failed responses are
+  closed before retrying, and no upload state is kept on the browser
+  between requests.
+
 * When the ``Content-Type`` header is missing, HTML is now detected from the
   first bytes of the response instead of decoding the whole body, which is
   much faster for large binary responses. Uppercase markup such as ``<HTML>``

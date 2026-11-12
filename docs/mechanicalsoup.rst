@@ -33,3 +33,5 @@ Exceptions
     :show-inheritance:
 .. autoexception:: InvalidFormMethod
     :show-inheritance:
+.. autoexception:: UploadNotReplayableError
+    :show-inheritance:

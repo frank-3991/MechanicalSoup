@@ -16,6 +16,21 @@ class LinkNotFoundError(Exception):
     pass
 
 
+class UploadNotReplayableError(LinkNotFoundError):
+    """Exception raised when a failed file upload cannot be retried.
+
+    A retry would require resending a file input whose content cannot be
+    replayed exactly, e.g. a non-seekable stream or a stream that was
+    already (partially) consumed by the failed attempt. Resending such
+    an input would transmit empty or duplicated bytes, so the upload
+    fails explicitly with this exception instead.
+
+    It is derived from :class:`LinkNotFoundError` so that a single base
+    class can be used to catch all exceptions specific to this module.
+    """
+    pass
+
+
 def is_multipart_file_upload(form, tag):
     return (
         form.get("enctype", "") == "multipart/form-data" and

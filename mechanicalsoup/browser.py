@@ -2,6 +2,7 @@ import io
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from typing import cast
 import urllib.parse
 import weakref
@@ -13,11 +14,117 @@ import requests
 
 from .__version__ import __title__, __version__
 from .form import Form
-from .utils import LinkNotFoundError, is_disabled, is_multipart_file_upload
+from .utils import (
+    LinkNotFoundError,
+    UploadNotReplayableError,
+    is_disabled,
+    is_multipart_file_upload,
+)
 
 
 class ResponseWithSoup(requests.Response):
     soup: bs4.BeautifulSoup | None
+
+
+class _UploadReplayPlan:
+    """Snapshot of the file inputs of one request, used to decide whether
+    a failed upload may be retried and to replay the inputs if so.
+
+    A file input is replayable when its content is an immutable value
+    (``str``/``bytes``) or a seekable stream whose position can be
+    recorded before the first attempt and restored before each retry.
+    Anything else (a non-seekable stream, a stream that was already
+    partially consumed and cannot be rewound, a generator, ...) cannot
+    be resent without risking empty or duplicated bytes, so a retry
+    fails explicitly with :class:`UploadNotReplayableError` instead of
+    sending a corrupted body.
+
+    The plan is local to a single request: nothing is stored on the
+    browser, so a failed upload cannot leak stale streams into later
+    requests made with the same browser.
+    """
+
+    def __init__(self, files):
+        # (name, stream, position) for replayable stream inputs.
+        self._streams = []
+        # Names of inputs whose content cannot be replayed.
+        self._non_replayable = []
+        for name, content in self._iter_contents(files):
+            if content is None or isinstance(content, (str, bytes)):
+                # Immutable content is trivially replayable.
+                continue
+            position = self._stream_position(content)
+            if position is None:
+                self._non_replayable.append(name)
+            else:
+                self._streams.append((name, content, position))
+
+    @staticmethod
+    def _iter_contents(files):
+        """Yield (name, content) for each entry of a requests-style
+        ``files`` argument (a mapping or a sequence of 2-tuples, with
+        values either raw content or (filename, content, ...) tuples).
+        """
+        if not files:
+            return
+        items = files.items() if isinstance(files, Mapping) else files
+        for name, value in items:
+            if isinstance(value, tuple) and len(value) >= 2:
+                yield name, value[1]
+            else:
+                yield name, value
+
+    @staticmethod
+    def _stream_position(stream):
+        """Return the current position of a stream if it can be restored
+        later, or None if the stream cannot be replayed."""
+        if not callable(getattr(stream, "seek", None)):
+            return None
+        if not callable(getattr(stream, "tell", None)):
+            return None
+        seekable = getattr(stream, "seekable", None)
+        try:
+            if callable(seekable) and not seekable():
+                return None
+            return stream.tell()
+        except (OSError, ValueError):
+            return None
+
+    def rewind(self):
+        """Restore every file input to the position it had before the
+        first attempt, so a retry sends exactly the same bytes.
+
+        :raise UploadNotReplayableError: If any input cannot be replayed
+            exactly. Raised before anything is sent, so a retry never
+            transmits empty or duplicated content.
+        """
+        if self._non_replayable:
+            names = ", ".join(repr(name) for name in self._non_replayable)
+            raise UploadNotReplayableError(
+                f"Cannot retry the upload: the content of file "
+                f"input(s) {names} cannot be replayed (non-seekable or "
+                f"already consumed stream). Resending it would transmit "
+                f"empty or duplicated bytes."
+            )
+        for name, stream, position in self._streams:
+            try:
+                if getattr(stream, "closed", False):
+                    raise OSError("stream is closed")
+                stream.seek(position)
+                actual = stream.tell()
+            except (OSError, ValueError) as exc:
+                raise UploadNotReplayableError(
+                    f"Cannot retry the upload: failed to rewind the "
+                    f"stream of file input {name!r} to position "
+                    f"{position} ({exc})."
+                ) from exc
+            if actual != position:
+                raise UploadNotReplayableError(
+                    f"Cannot retry the upload: the stream of file input "
+                    f"{name!r} could not be restored to position "
+                    f"{position} (it is now at {actual}). Resending it "
+                    f"would transmit empty or duplicated bytes."
+                )
 
 
 class Browser:
@@ -347,17 +454,72 @@ class Browser:
         form,
         url=None,
         submit=None,
+        retries=0,
+        retry_statuses=(),
         **kwargs,
     ) -> requests.Response:
-        """Extract input data from the form to pass to a Requests session."""
-        request_kwargs = self.get_request_kwargs(form, url, submit, **kwargs)
-        return self.session.request(**request_kwargs)
+        """Extract input data from the form to pass to a Requests session.
+
+        :param retries: Number of times a failed request is retried.
+            The default of 0 keeps the regular one-shot behavior.
+        :param retry_statuses: HTTP status codes (e.g. ``(502, 503)``)
+            that trigger a retry. Network-level failures
+            (:class:`requests.exceptions.RequestException`) are always
+            retried when ``retries`` allows it.
+
+        Retrying a form with file uploads is only possible when every
+        file input can be replayed exactly (see
+        :class:`_UploadReplayPlan`); otherwise
+        :class:`UploadNotReplayableError` is raised before anything is
+        resent. Each attempt rebuilds the request from the current form
+        state, and the response of a failed attempt is closed before
+        retrying so that neither error responses nor partially consumed
+        streams leak into the next attempt or into later requests made
+        with the same browser.
+        """
+        if retries < 0:
+            raise ValueError("retries must be >= 0")
+        retry_statuses = frozenset(retry_statuses)
+        replay_plan = None
+        attempt = 0
+        while True:
+            # Build the request from the current form state on every
+            # attempt so that each retry carries the same fields.
+            request_kwargs = self.get_request_kwargs(form, url, submit,
+                                                     **kwargs)
+            if replay_plan is None:
+                # Snapshot the file inputs before the first attempt
+                # consumes them.
+                replay_plan = _UploadReplayPlan(request_kwargs.get("files"))
+            else:
+                # Raises UploadNotReplayableError before anything is
+                # sent if an input cannot be replayed exactly.
+                replay_plan.rewind()
+            try:
+                response = self.session.request(**request_kwargs)
+            except requests.exceptions.RequestException as exc:
+                # Close the error response (if the failure produced one)
+                # so its resources cannot pollute the next attempt.
+                if exc.response is not None:
+                    exc.response.close()
+                if attempt >= retries:
+                    raise
+            else:
+                if (attempt >= retries or
+                        response.status_code not in retry_statuses):
+                    return response
+                # Release the failed response and its connection before
+                # retrying; the caller only owns the final response.
+                response.close()
+            attempt += 1
 
     def submit(
         self,
         form,
         url=None,
         btnName=None,
+        retries=0,
+        retry_statuses=(),
         **kwargs,
     ) -> ResponseWithSoup:
         """Prepares and sends a form request.
@@ -372,6 +534,14 @@ class Browser:
         :param btnName: Passed to :func:`Form.choose_submit` to choose the
             element of the form to use for submission. If not ``None``, will
             override any existing chosen submit in the form.
+        :param retries: Number of times a failed submission is retried.
+            File uploads are only retried when every file input can be
+            replayed exactly; otherwise :class:`UploadNotReplayableError`
+            is raised. The default of 0 keeps the regular one-shot
+            behavior.
+        :param retry_statuses: HTTP status codes (e.g. ``(502, 503)``)
+            that trigger a retry, in addition to network-level failures
+            which are always retried when ``retries`` allows it.
         :param \\*\\*kwargs: Arguments forwarded to `requests.Session.request
             <http://docs.python-requests.org/en/master/api/#requests.Session.request>`__.
             If `files`, `params` (with GET), or `data` (with POST) are
@@ -387,7 +557,8 @@ class Browser:
         if (submit is None) or (btnName is not None):
             submit = form.choose_submit(btnName)
 
-        response = self._request(form.form, url, submit, **kwargs)
+        response = self._request(form.form, url, submit, retries=retries,
+                                 retry_statuses=retry_statuses, **kwargs)
         return Browser.add_soup(response, self.soup_config)
 
     def launch_browser(self, soup):
