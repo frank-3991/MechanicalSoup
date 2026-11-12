@@ -1,6 +1,8 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 import re
 import sys
+from typing import Any
 import urllib.parse
 
 import bs4
@@ -132,6 +134,19 @@ class StatefulBrowser(Browser):
         See :func:`Form.__setitem__`.
         """
         self.form[name] = value
+
+    def set_values(
+        self,
+        data: Mapping[str, Any],
+        *,
+        atomic: bool = False,
+    ) -> None:
+        """Fill several fields in the currently selected form.
+
+        See :func:`Form.set_values` for the available controls and the
+        meaning of ``atomic``.
+        """
+        return self.form.set_values(data, atomic=atomic)
 
     def new_control(self, type, name, value, **kwargs):
         """Call :func:`Form.new_control` on the currently selected form."""

@@ -1,12 +1,35 @@
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 import copy
 import io
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 import warnings
 
 import bs4
 
 from .utils import LinkNotFoundError, is_multipart_file_upload
+
+
+@dataclass
+class _ControlIndex:
+    inputs: dict[str, bs4.element.Tag] = field(default_factory=dict)
+    textareas: dict[str, bs4.element.Tag] = field(default_factory=dict)
+    checkboxes: dict[str, list[bs4.element.Tag]] = field(default_factory=dict)
+    radios: dict[str, list[bs4.element.Tag]] = field(default_factory=dict)
+    selects: dict[str, bs4.element.Tag] = field(default_factory=dict)
+
+
+@dataclass
+class _ControlState:
+    tag: bs4.element.Tag
+    attrs: dict[str, Any]
+    contents: list[Any]
+
+
+@dataclass
+class _Operation:
+    apply: Callable[[], None]
+    touched: tuple[bs4.element.Tag, ...]
 
 
 class InvalidFormMethod(LinkNotFoundError):
@@ -245,6 +268,463 @@ class Form:
                     )
 
                 option.attrs["selected"] = "selected"
+
+    def set_values(
+        self,
+        data: Mapping[str, Any],
+        *,
+        atomic: bool = False,
+    ) -> None:
+        """Fill several fields using the same type selection as :func:`set`.
+
+        The controls in ``data`` are processed in mapping order. Building the
+        field index requires one traversal of the form, so filling a form is
+        linear in the combined number of controls and supplied values.
+
+        :param data: Dict of ``{name: value, ...}``.
+        :param atomic: When true, validate every field before applying
+            changes. If a field or option does not exist, or a file upload
+            value is invalid, the form is restored to its state before this
+            call. When false (the default), fields are applied one at a time
+            and changes made before an exception remain visible.
+        """
+        index = self._build_index(data)
+        if atomic:
+            self._set_values_atomic(data, index)
+            return
+
+        for name, value in data.items():
+            self._apply_field(name, value, index)
+
+    def _set_values_atomic(
+        self,
+        data: Mapping[str, Any],
+        index: _ControlIndex,
+    ) -> None:
+        operations: list[_Operation] = []
+        state: list[_ControlState] = []
+        snapshot_ids: set[int] = set()
+        for name, value in data.items():
+            apply, touched = self._build_operation(name, value, index)
+            operations.append(_Operation(apply, touched))
+            for tag in touched:
+                if id(tag) not in snapshot_ids:
+                    snapshot_ids.add(id(tag))
+                    state.append(self._snapshot_control(tag))
+
+        for batch_operation in operations:
+            try:
+                batch_operation.apply()
+            except Exception:
+                for snapshot in state:
+                    self._restore_control(snapshot)
+                raise
+
+    def _build_index(self, data: Mapping[str, Any]) -> _ControlIndex:
+        """Build lookup tables only for fields this call needs to fill."""
+        wanted = frozenset(data)
+        index = _ControlIndex()
+
+        for tag in self.form.find_all(
+            ("input", "textarea", "select"),
+            attrs={"name": True},
+        ):
+            name = tag.get("name")
+            if name not in wanted:
+                continue
+
+            if tag.name == "input":
+                input_type = tag.get("type", "")
+                if not isinstance(input_type, str):
+                    continue
+
+                input_type = input_type.lower()
+                if input_type == "checkbox":
+                    index.checkboxes.setdefault(name, []).append(tag)
+                elif input_type == "radio":
+                    index.radios.setdefault(name, []).append(tag)
+                else:
+                    index.inputs.setdefault(name, tag)
+            elif tag.name == "textarea":
+                index.textareas.setdefault(name, tag)
+            else:
+                index.selects.setdefault(name, tag)
+
+        return index
+
+    def _build_operation(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ) -> tuple[Callable[[], None], tuple[bs4.element.Tag, ...]]:
+        """Return an operation and the tags it will change."""
+        builders = (
+            lambda: self._build_checkbox_operation(name, value, index),
+            lambda: self._build_radio_operation(name, value, index),
+            lambda: self._build_text_input_operation(name, value, index),
+            lambda: self._build_textarea_operation(name, value, index),
+            lambda: self._build_select_operation(
+                name, value, index.selects.get(name)),
+        )
+
+        for builder in builders:
+            try:
+                return builder()
+            except InvalidFormMethod:
+                continue
+
+        raise LinkNotFoundError("No valid element named " + name)
+
+    def _apply_field(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ) -> None:
+        """Apply one field incrementally, preserving legacy partial effects."""
+        appliers = (
+            lambda: self._apply_checkbox(name, value, index),
+            lambda: self._apply_radio(name, value, index),
+            lambda: self._apply_text_input(name, value, index),
+            lambda: self._apply_textarea(name, value, index),
+            lambda: self._apply_select(name, value, index),
+        )
+
+        for applier in appliers:
+            try:
+                applier()
+                return
+            except InvalidFormMethod:
+                continue
+
+        raise LinkNotFoundError("No valid element named " + name)
+
+    def _apply_checkbox(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ) -> None:
+        if name not in index.checkboxes:
+            raise InvalidFormMethod("No input checkbox named " + name)
+        checkboxes = index.checkboxes[name]
+        checkboxes_by_value = {
+            checkbox.attrs.get("value", "on"): checkbox
+            for checkbox in reversed(checkboxes)
+        }
+
+        for checkbox in checkboxes:
+            if "checked" in checkbox.attrs:
+                del checkbox.attrs["checked"]
+
+        for choice in self._as_value_tuple(value):
+            if choice is True:
+                checkboxes[0]["checked"] = ""
+                continue
+            if choice is False:
+                if "checked" in checkboxes[0].attrs:
+                    del checkboxes[0].attrs["checked"]
+                continue
+
+            checkbox = checkboxes_by_value.get(str(choice))
+            if checkbox is None:
+                raise LinkNotFoundError(
+                    "No input checkbox named %s with choice %s" %
+                    (name, choice)
+                )
+            checkbox["checked"] = ""
+
+    def _apply_radio(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ) -> None:
+        if name not in index.radios:
+            raise InvalidFormMethod("No input radio named " + name)
+        radios = index.radios[name]
+
+        for radio in radios:
+            if "checked" in radio.attrs:
+                del radio.attrs["checked"]
+
+        radios_by_value: dict[str, bs4.element.Tag] = {}
+        for radio in reversed(radios):
+            radios_by_value.setdefault(radio.attrs.get("value", "on"), radio)
+        chosen = radios_by_value.get(str(value))
+        if chosen is None:
+            raise LinkNotFoundError(
+                f"No input radio named {name} with choice {value}"
+            )
+        chosen["checked"] = ""
+
+    def _apply_text_input(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ) -> None:
+        if name not in index.inputs:
+            raise InvalidFormMethod("No input field named " + name)
+        tag = index.inputs[name]
+        self._assert_valid_file_upload(tag, value)
+        tag["value"] = value
+
+    @staticmethod
+    def _apply_textarea(
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ) -> None:
+        if name not in index.textareas:
+            raise InvalidFormMethod("No textarea named " + name)
+        index.textareas[name].string = value
+
+    def _apply_select(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ) -> None:
+        if name not in index.selects:
+            raise InvalidFormMethod("No select named " + name)
+        select = index.selects[name]
+        options = select.find_all("option")
+
+        for option in options:
+            if "selected" in option.attrs:
+                del option.attrs["selected"]
+
+        choices = self._as_value_tuple(value)
+        if isinstance(value, (list, tuple)) and "multiple" not in select.attrs:
+            raise LinkNotFoundError("Cannot select multiple options!")
+
+        option_index = self._index_select_options(options)
+        for choice in choices:
+            option = self._find_select_option(select, choice, option_index)
+            if option is None:
+                raise LinkNotFoundError(
+                    f'Option {choice} not found for select {name}'
+                )
+            option.attrs["selected"] = "selected"
+
+    def _build_text_input_operation(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ):
+        if name not in index.inputs:
+            raise InvalidFormMethod("No input field named " + name)
+        tag = index.inputs[name]
+        self._assert_valid_file_upload(tag, value)
+
+        def operation():
+            tag["value"] = value
+
+        return operation, (tag,)
+
+    @staticmethod
+    def _build_textarea_operation(
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ):
+        if name not in index.textareas:
+            raise InvalidFormMethod("No textarea named " + name)
+        tag = index.textareas[name]
+
+        def operation():
+            tag.string = value
+
+        return operation, (tag,)
+
+    def _build_checkbox_operation(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ):
+        if name not in index.checkboxes:
+            raise InvalidFormMethod("No input checkbox named " + name)
+        checkboxes = index.checkboxes[name]
+        choices = self._as_value_tuple(value)
+        checks = {tag: False for tag in checkboxes}
+        checkboxes_by_value: dict[str, bs4.element.Tag] = {}
+        for checkbox in checkboxes:
+            checkboxes_by_value.setdefault(
+                checkbox.attrs.get("value", "on"), checkbox)
+
+        for choice in choices:
+            if choice is True:
+                checks[checkboxes[0]] = True
+                continue
+            if choice is False:
+                checks[checkboxes[0]] = False
+                continue
+
+            choice_str = str(choice)
+            checkbox = checkboxes_by_value.get(choice_str)
+            if checkbox is None:
+                raise LinkNotFoundError(
+                    "No input checkbox named %s with choice %s" %
+                    (name, choice)
+                )
+            checks[checkbox] = True
+
+        def operation():
+            for checkbox, checked in checks.items():
+                if checked:
+                    checkbox["checked"] = ""
+                elif "checked" in checkbox.attrs:
+                    del checkbox.attrs["checked"]
+
+        return operation, tuple(checkboxes)
+
+    def _build_radio_operation(
+        self,
+        name: str,
+        value: Any,
+        index: _ControlIndex,
+    ):
+        if name not in index.radios:
+            raise InvalidFormMethod("No input radio named " + name)
+        radios = index.radios[name]
+        choice_str = str(value)
+        radios_by_value = {
+            radio.attrs.get("value", "on"): radio
+            for radio in reversed(radios)
+        }
+        chosen = radios_by_value.get(choice_str)
+
+        if chosen is None:
+            raise LinkNotFoundError(
+                f"No input radio named {name} with choice {value}"
+            )
+
+        def operation():
+            for radio in radios:
+                if "checked" in radio.attrs:
+                    del radio.attrs["checked"]
+            chosen["checked"] = ""
+
+        return operation, tuple(radios)
+
+    def _build_select_operation(
+        self,
+        name: str,
+        value: Any,
+        select: bs4.element.Tag | None,
+    ):
+        if select is None:
+            raise InvalidFormMethod("No select named " + name)
+        options = select.find_all("option")
+        choices = self._as_value_tuple(value)
+        if isinstance(value, (list, tuple)) and "multiple" not in select.attrs:
+            raise LinkNotFoundError("Cannot select multiple options!")
+
+        option_index = self._index_select_options(options)
+        chosen_options = []
+        for choice in choices:
+            option = self._find_select_option(select, choice, option_index)
+            if option is None:
+                raise LinkNotFoundError(
+                    f'Option {choice} not found for select {name}'
+                )
+            chosen_options.append(option)
+
+        def operation():
+            for option in options:
+                if "selected" in option.attrs:
+                    del option.attrs["selected"]
+            for option in chosen_options:
+                option.attrs["selected"] = "selected"
+
+        return operation, tuple(options)
+
+    @staticmethod
+    def _find_select_option(
+        select,
+        choice,
+        option_index,
+    ):
+        (options_by_value, options_without_value, options_by_text,
+         first_option, first_option_with_value) = option_index
+        try:
+            if choice is None or choice is False:
+                option = (
+                    options_without_value[0]
+                    if options_without_value else
+                    first_option
+                )
+            elif choice == "":
+                option = (
+                    options_without_value[0]
+                    if options_without_value else
+                    options_by_value.get("", first_option)
+                )
+            elif choice is True:
+                option = first_option_with_value or first_option
+            else:
+                option = options_by_value.get(
+                    choice,
+                    options_by_value.get(
+                        str(choice),
+                        options_by_text.get(choice),
+                    ),
+                )
+        except TypeError:
+            option = select.find("option", {"value": choice})
+            if option is None:
+                option = select.find("option", string=choice)
+        return option
+
+    @staticmethod
+    def _index_select_options(options):
+        options_by_value = {}
+        options_without_value = []
+        options_by_text = {}
+        first_option = options[0] if options else None
+        first_option_with_value = None
+        for option in options:
+            if option.has_attr("value"):
+                value = option["value"]
+                options_by_value.setdefault(value, option)
+                options_by_value.setdefault(str(value), option)
+                if first_option_with_value is None:
+                    first_option_with_value = option
+            else:
+                options_without_value.append(option)
+            options_by_text.setdefault(option.string, option)
+        return (
+            options_by_value,
+            options_without_value,
+            options_by_text,
+            first_option,
+            first_option_with_value,
+        )
+
+    @staticmethod
+    def _as_value_tuple(value):
+        if isinstance(value, (list, tuple)):
+            return tuple(value)
+        return (value,)
+
+    @staticmethod
+    def _snapshot_control(tag):
+        return _ControlState(
+            tag=tag,
+            attrs=dict(tag.attrs),
+            contents=copy.deepcopy(tag.contents),
+        )
+
+    @staticmethod
+    def _restore_control(snapshot):
+        snapshot.tag.attrs = dict(snapshot.attrs)
+        snapshot.tag.clear()
+        for content in copy.deepcopy(snapshot.contents):
+            snapshot.tag.append(content)
 
     def __setitem__(self, name: str, value: Any) -> None:
         """Forwards arguments to :func:`~Form.set`. For example,

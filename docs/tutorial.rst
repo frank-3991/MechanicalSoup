@@ -128,6 +128,27 @@ helper to fill-in a form, but you can use any tool BeautifulSoup
 provides to modify the soup object, and MechanicalSoup will take care
 of submitting the form for you.
 
+Several fields can be filled together with
+:func:`~mechanicalsoup.StatefulBrowser.set_values`. This is useful for
+large forms because the controls are indexed once instead of searching
+the whole form for each field::
+
+  >>> browser.set_values({
+  ...     "custname": "Me",
+  ...     "size": "medium",
+  ...     "topping": ("bacon", "cheese"),
+  ... })
+
+Pass ``atomic=True`` to validate the complete mapping before changing
+anything. If a field, option, or file upload value is invalid, the form
+is left exactly as it was before the call::
+
+  >>> browser.set_values({
+  ...     "custname": "Me",
+  ...     "size": "medium",
+  ...     "topping": ("bacon", "cheese"),
+  ... }, atomic=True)
+
 Let's see what the filled-in form looks like::
 
   >>> browser.launch_browser()

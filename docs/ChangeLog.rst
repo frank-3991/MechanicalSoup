@@ -16,6 +16,11 @@ Version 1.5 (in development)
 * ``StatefulBrowser.links`` now raises an explanatory ``AttributeError`` when
   no page is loaded, instead of failing inside BeautifulSoup.
 
+* ``Form.set_values`` and ``StatefulBrowser.set_values`` can fill multiple
+  controls in one linear pass. Passing ``atomic=True`` validates the complete
+  mapping before changing the form and restores every control if a field,
+  option, or file upload value is invalid.
+
 Version 1.4
 ===========
 

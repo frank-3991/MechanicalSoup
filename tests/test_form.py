@@ -548,5 +548,314 @@ def test_option_without_value(fail, selected, expected_post):
         assert res.status_code == 200 and res.text == 'Success!'
 
 
+batch_form = '''
+<form method="post" action="mock://form.com/post">
+  <input name="text" value="old text" />
+  <textarea name="comment">old comment</textarea>
+  <input type="checkbox" name="toppings" value="cheese" checked />
+  <input type="checkbox" name="toppings" value="onion" />
+  <input type="radio" name="size" value="small" checked />
+  <input type="radio" name="size" value="large" />
+  <select name="entree">
+    <option value="tofu" selected>Tofu</option>
+    <option value="curry">Curry</option>
+  </select>
+  <select name="sides" multiple>
+    <option value="rice" selected>Rice</option>
+    <option value="soup">Soup</option>
+    <option>Bread</option>
+  </select>
+  <input type="submit" name="save" value="Save" />
+</form>
+'''
+
+batch_values = {
+    'text': 'new text',
+    'toppings': ('cheese', 'onion'),
+    'size': 'large',
+    'comment': 'new comment',
+    'entree': 'curry',
+    'sides': ('soup', 'Bread'),
+}
+
+batch_expected_post = [
+    ('text', 'new text'),
+    ('comment', 'new comment'),
+    ('toppings', 'cheese'),
+    ('toppings', 'onion'),
+    ('size', 'large'),
+    ('entree', 'curry'),
+    ('sides', 'soup'),
+    ('sides', 'Bread'),
+    ('save', 'Save'),
+]
+
+
+def test_set_values_mixed_controls_and_submission_order():
+    browser, url = setup_mock_browser(
+        expected_post=batch_expected_post, text=batch_form)
+    browser.open(url)
+    form = browser.select_form('form')
+
+    form.set_values(batch_values)
+
+    response = browser.submit_selected()
+    assert response.status_code == 200 and response.text == 'Success!'
+
+
+def test_set_values_atomic_success_updates_existing_form():
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(batch_form)
+    form = browser.select_form('form')
+    page = browser.page
+    text_input = form.form.find('input', {'name': 'text'})
+
+    form.set_values(batch_values, atomic=True)
+
+    assert browser.form is form
+    assert browser.page is page
+    assert form.form is page.find('form')
+    assert text_input is form.form.find('input', {'name': 'text'})
+    assert text_input['value'] == 'new text'
+
+
+def test_set_values_rebuilds_index_for_current_page():
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(batch_form)
+    form = browser.select_form('form')
+
+    form.set_values({'text': 'first text'})
+    new_control = bs4.BeautifulSoup(
+        '<input name="added" value="old" />', 'html.parser').input
+    form.form.append(new_control)
+    form.set_values({'added': 'new value', 'text': 'second text'})
+
+    assert form.form.find('input', {'name': 'added'})['value'] == 'new value'
+    assert form.form.find('input', {'name': 'text'})['value'] == 'second text'
+
+
+def test_set_values_can_be_repeated_on_the_same_fields():
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(batch_form)
+    form = browser.select_form('form')
+
+    form.set_values({'text': 'first', 'size': 'large'})
+    form.set_values({'text': 'second', 'size': 'small'}, atomic=True)
+
+    assert form.form.find('input', {'name': 'text'})['value'] == 'second'
+    assert form.form.find('input', {'value': 'small'}).has_attr('checked')
+    assert not form.form.find('input', {'value': 'large'}).has_attr(
+        'checked')
+
+
+def test_set_values_keeps_set_control_selection_order():
+    html = '''
+    <form>
+      <input type="checkbox" name="field" value="checkbox" />
+      <input type="radio" name="field" value="radio" />
+      <input name="field" value="old input" />
+      <textarea name="field">old textarea</textarea>
+      <select name="field">
+        <option value="old" selected />
+        <option value="select" />
+      </select>
+    </form>
+    '''
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup(html, 'html.parser').form)
+
+    form.set_values({'field': 'checkbox'})
+
+    text_input = form.form.select('input[name="field"]:not([type])')[0]
+    assert text_input['value'] == 'old input'
+    assert form.form.find('textarea', {'name': 'field'}).text == \
+        'old textarea'
+    assert form.form.find('input', {'value': 'checkbox'}).has_attr('checked')
+    assert form.form.find('option', {'value': 'old'}).has_attr('selected')
+
+
+def test_set_values_does_not_fallback_after_matching_choice_group():
+    html = '''
+    <form>
+      <input type="checkbox" name="field" value="checkbox" />
+      <select name="field">
+        <option value="old" selected />
+        <option value="select" />
+      </select>
+    </form>
+    '''
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup(html, 'html.parser').form)
+
+    with pytest.raises(mechanicalsoup.LinkNotFoundError,
+                       match='No input checkbox named field'):
+        form.set_values({'field': 'select'})
+
+    assert form.form.find('option', {'value': 'old'}).has_attr('selected')
+
+
+def test_set_values_select_option_matching_matches_set():
+    html = '''
+    <form>
+      <select name="field">
+        <option>text option</option>
+        <option value="1">numeric option</option>
+        <option value="">empty option</option>
+        <option value="True">boolean option</option>
+      </select>
+    </form>
+    '''
+    for value in ('text option', 1, '', True):
+        batch_form = mechanicalsoup.Form(
+            bs4.BeautifulSoup(html, 'html.parser').form)
+        single_form = mechanicalsoup.Form(
+            bs4.BeautifulSoup(html, 'html.parser').form)
+
+        batch_form.set_values({'field': value})
+        single_form.set('field', value)
+
+        assert str(batch_form.form) == str(single_form.form)
+
+
+def test_set_values_partial_changes_remain_after_failure():
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(batch_form)
+    form = browser.select_form('form')
+
+    with pytest.raises(mechanicalsoup.LinkNotFoundError,
+                       match='Option missing not found'):
+        form.set_values({
+            'text': 'changed text',
+            'entree': 'missing',
+            'size': 'large',
+        })
+
+    assert form.form.find('input', {'name': 'text'})['value'] == 'changed text'
+    assert not form.form.find(
+        'option', {'value': 'tofu'}).has_attr('selected')
+    assert form.form.find('input', {'value': 'small'}).has_attr('checked')
+
+
+def test_set_values_partial_effect_inside_choice_group():
+    html = '''
+    <form>
+      <input type="checkbox" name="choices" value="first" checked />
+      <input type="checkbox" name="choices" value="second" />
+      <select name="options" multiple>
+        <option value="old" selected />
+        <option value="first" />
+        <option value="second" />
+      </select>
+    </form>
+    '''
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(html)
+    form = browser.select_form('form')
+
+    with pytest.raises(mechanicalsoup.LinkNotFoundError,
+                       match='No input checkbox named choices'):
+        form.set_values({'choices': ('first', 'missing')})
+
+    assert form.form.find(
+        'input', {'value': 'first'}).has_attr('checked')
+    assert not form.form.find(
+        'input', {'value': 'second'}).has_attr('checked')
+
+    with pytest.raises(mechanicalsoup.LinkNotFoundError,
+                       match='Option missing not found'):
+        form.set_values({'options': ('first', 'missing')})
+
+    assert form.form.find(
+        'option', {'value': 'first'}).has_attr('selected')
+    assert not form.form.find(
+        'option', {'value': 'old'}).has_attr('selected')
+
+
+@pytest.mark.parametrize(
+    'values, match',
+    [
+        ({'missing': 'value'}, 'No valid element named missing'),
+        ({'toppings': ('missing',)}, 'No input checkbox named toppings'),
+        ({'size': 'missing'}, 'No input radio named size'),
+        ({'entree': 'missing'}, 'Option missing not found'),
+    ],
+)
+def test_set_values_atomic_rolls_back_controls(values, match):
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(batch_form)
+    form = browser.select_form('form')
+    original = str(form.form)
+    submit = form.choose_submit('save')
+
+    with pytest.raises(mechanicalsoup.LinkNotFoundError, match=match):
+        form.set_values({**batch_values, **values}, atomic=True)
+
+    assert str(form.form) == original
+    assert form.submit_chosen is submit
+    assert form.choose_submit('save') is submit
+
+
+def test_set_values_atomic_rolls_back_invalid_upload():
+    html = '''
+    <form enctype="multipart/form-data">
+      <input name="text" value="old" />
+      <input type="file" name="upload" />
+    </form>
+    '''
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(html)
+    form = browser.select_form('form')
+    original = str(form.form)
+
+    with pytest.raises(ValueError, match='CVE-2023-34457'):
+        form.set_values({'text': 'new', 'upload': '/missing/file'},
+                        atomic=True)
+
+    assert str(form.form) == original
+
+
+def test_stateful_browser_set_values_uses_current_form():
+    browser = mechanicalsoup.StatefulBrowser()
+    browser.open_fake_page(batch_form)
+    browser.select_form('form')
+
+    browser.set_values({'text': 'browser text'})
+
+    assert browser.form.form.find(
+        'input', {'name': 'text'})['value'] == 'browser text'
+
+
+def test_set_values_lookup_is_linear_in_form_and_data(mocker):
+    html = ['<form>']
+    for index in range(100):
+        html.append(f'<input name="text{index}" value="old" />')
+        html.append(
+            f'<input type="checkbox" name="check{index}" value="a" />')
+        html.append(
+            f'<input type="checkbox" name="check{index}" value="b" />')
+        html.append(f'<select name="select{index}">'
+                    '<option value="a" /><option value="b" /></select>')
+    html.append('</form>')
+
+    form = mechanicalsoup.Form(
+        bs4.BeautifulSoup(''.join(html), 'html.parser').form)
+    find_all = mocker.spy(form.form, 'find_all')
+
+    form.set_values({
+        f'text{index}': f'value {index}'
+        for index in range(100)
+    })
+    assert find_all.call_count == 1
+
+    form.set_values({
+        f'check{index}': ('a', 'b')
+        for index in range(100)
+    } | {
+        f'select{index}': 'b'
+        for index in range(100)
+    })
+    assert find_all.call_count == 2
+
+
 if __name__ == '__main__':
     pytest.main(sys.argv)
