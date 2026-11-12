@@ -50,6 +50,10 @@ class Browser:
     :param raise_on_404: If True, raise :class:`LinkNotFoundError`
         when visiting a page triggers a 404 Not Found error.
     :param user_agent: Set the user agent header to this value.
+    :param recorder: An optional :class:`~mechanicalsoup.recorder.Recorder`
+        used to record each request performed by this browser to a local
+        file. When ``None`` (the default), nothing is recorded and the
+        behavior of requests and session adapters is unchanged.
 
     """
     def __init__(
@@ -59,9 +63,11 @@ class Browser:
         requests_adapters=None,
         raise_on_404=False,
         user_agent=None,
+        recorder=None,
     ):
         self.raise_on_404 = raise_on_404
         self.session = session or requests.Session()
+        self.recorder = recorder
 
         self._finalize = weakref.finalize(self.session, self.close)
 
@@ -167,8 +173,92 @@ class Browser:
         need an HTTP verb that MechanicalSoup doesn't manage (e.g. MKCOL) for
         example.
         """
-        response = self.session.request(*args, **kwargs)
+        if self.recorder is None:
+            response = self.session.request(*args, **kwargs)
+        else:
+            response = self._send_request("navigation", *args, **kwargs)
         return Browser.add_soup(response, self.soup_config)
+
+    # Parameter names of requests.Session.request, in positional order.
+    _REQUEST_PARAM_NAMES = (
+        "method", "url", "params", "data", "headers", "cookies", "files",
+        "auth", "timeout", "allow_redirects", "proxies", "hooks", "stream",
+        "verify", "cert", "json",
+    )
+
+    def _send_request(self, operation, *args, **kwargs):
+        """Call ``self.session.request`` while recording the operation.
+
+        The request is prepared first, so that a failure during
+        preparation is recorded as ``not_sent`` while a failure during
+        sending is recorded as ``unknown`` (the server may have received
+        the request). Recording failures never affect the request
+        itself.
+        """
+        from .recorder import _REQUEST_KWARGS, _SEND_KWARGS
+
+        recorder = self.recorder
+
+        # Map positional arguments onto the parameter names of
+        # requests.Session.request so the request can be prepared
+        # explicitly.
+        if len(args) > len(self._REQUEST_PARAM_NAMES):
+            raise TypeError(
+                f"request() takes at most "
+                f"{len(self._REQUEST_PARAM_NAMES)} positional arguments "
+                f"but {len(args)} were given")
+        for name, value in zip(self._REQUEST_PARAM_NAMES, args):
+            if name in kwargs:
+                raise TypeError(
+                    f"request() got multiple values for argument "
+                    f"'{name}'")
+            kwargs[name] = value
+        method = kwargs.pop("method")
+        url = kwargs.pop("url")
+        record = recorder.build_record(operation, method, url, kwargs)
+
+        req_kwargs = {k: v for k, v in kwargs.items() if k in _REQUEST_KWARGS}
+        send_kwargs = {k: v for k, v in kwargs.items() if k in _SEND_KWARGS}
+        request = requests.Request(method=method.upper(), url=url,
+                                   **req_kwargs)
+        try:
+            prep = self.session.prepare_request(request)
+        except Exception as exc:
+            # The request was never sent: the server cannot have
+            # received anything.
+            record.status = "not_sent"
+            record.error = repr(exc)
+            recorder.write(record)
+            raise
+
+        proxies = send_kwargs.get("proxies") or {}
+        settings = self.session.merge_environment_settings(
+            prep.url, proxies, send_kwargs.get("stream"),
+            send_kwargs.get("verify"), send_kwargs.get("cert"))
+        send_kwargs.update(settings)
+        send_kwargs.setdefault("allow_redirects", True)
+
+        try:
+            response = self.session.send(prep, **send_kwargs)
+        except Exception as exc:
+            # The request was sent (or may have been): whether the
+            # server processed it is unknown.
+            record.status = "unknown"
+            record.error = repr(exc)
+            recorder.write(record)
+            raise
+
+        record.status = "completed"
+        record.response_status = response.status_code
+        record.final_url = response.url
+        record.page_url = response.url
+        record.redirects = [
+            {"method": r.request.method, "url": r.url,
+             "status_code": r.status_code}
+            for r in response.history
+        ]
+        recorder.write(record)
+        return response
 
     def get(self, *args, **kwargs) -> ResponseWithSoup:
         """Straightforward wrapper around `requests.Session.get
@@ -178,7 +268,15 @@ class Browser:
             <http://docs.python-requests.org/en/master/api/#requests.Response>`__
             object with a *soup*-attribute added by :func:`add_soup`.
         """
-        response = self.session.get(*args, **kwargs)
+        if self.recorder is None:
+            response = self.session.get(*args, **kwargs)
+        else:
+            args = list(args)
+            url = args.pop(0)
+            if args:
+                kwargs.setdefault("params", args.pop(0))
+            response = self._send_request("navigation", "GET", url,
+                                          **kwargs)
         if self.raise_on_404 and response.status_code == 404:
             raise LinkNotFoundError()
         return Browser.add_soup(response, self.soup_config)
@@ -191,7 +289,17 @@ class Browser:
             <http://docs.python-requests.org/en/master/api/#requests.Response>`__
             object with a *soup*-attribute added by :func:`add_soup`.
         """
-        response = self.session.post(*args, **kwargs)
+        if self.recorder is None:
+            response = self.session.post(*args, **kwargs)
+        else:
+            args = list(args)
+            url = args.pop(0)
+            if args:
+                kwargs.setdefault("data", args.pop(0))
+            if args:
+                kwargs.setdefault("json", args.pop(0))
+            response = self._send_request("submission", "POST", url,
+                                          **kwargs)
         return Browser.add_soup(response, self.soup_config)
 
     def put(self, *args, **kwargs) -> ResponseWithSoup:
@@ -202,7 +310,15 @@ class Browser:
             <http://docs.python-requests.org/en/master/api/#requests.Response>`__
             object with a *soup*-attribute added by :func:`add_soup`.
         """
-        response = self.session.put(*args, **kwargs)
+        if self.recorder is None:
+            response = self.session.put(*args, **kwargs)
+        else:
+            args = list(args)
+            url = args.pop(0)
+            if args:
+                kwargs.setdefault("data", args.pop(0))
+            response = self._send_request("submission", "PUT", url,
+                                          **kwargs)
         return Browser.add_soup(response, self.soup_config)
 
     @staticmethod
@@ -351,7 +467,9 @@ class Browser:
     ) -> requests.Response:
         """Extract input data from the form to pass to a Requests session."""
         request_kwargs = self.get_request_kwargs(form, url, submit, **kwargs)
-        return self.session.request(**request_kwargs)
+        if self.recorder is None:
+            return self.session.request(**request_kwargs)
+        return self._send_request("submission", **request_kwargs)
 
     def submit(
         self,

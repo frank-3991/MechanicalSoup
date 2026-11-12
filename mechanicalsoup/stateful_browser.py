@@ -50,6 +50,9 @@ class StatefulBrowser(Browser):
     :param raise_on_404: If True, raise :class:`LinkNotFoundError`
         when visiting a page triggers a 404 Not Found error.
     :param user_agent: Set the user agent header to this value.
+    :param recorder: An optional :class:`~mechanicalsoup.recorder.Recorder`
+        used to record each navigation and form submission to a local
+        file. When ``None`` (the default), nothing is recorded.
 
     All arguments are forwarded to :func:`Browser`.
 
