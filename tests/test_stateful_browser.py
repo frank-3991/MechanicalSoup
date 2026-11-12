@@ -901,6 +901,79 @@ def test_refresh_error():
         browser.refresh()
 
 
+def test_open_failure_preserves_state():
+    """A request that fails to send must not modify the browser state."""
+    url = 'mock://example.com'
+    browser, adapter = prepare_mock_browser()
+    mock_get(adapter, url=url, reply='<p>Fake empty page</p>')
+    browser.open(url)
+    page = browser.page
+
+    adapter.register_uri('GET', 'mock://example.com/broken',
+                         exc=requests.ConnectionError)
+    with pytest.raises(requests.ConnectionError):
+        browser.open('mock://example.com/broken')
+
+    assert browser.url == url
+    assert browser.page is page
+
+
+def test_submit_selected_failure_preserves_state():
+    """A form submission that fails to send must not modify the browser
+    state: the page and the selected form remain usable."""
+    form_page = '''
+    <html><body>
+      <form method="post" action="mock://example.com/post">
+        <input name="field" value="value"/>
+        <input type="submit" name="send" value="Send"/>
+      </form>
+    </body></html>
+    '''
+    browser, adapter = prepare_mock_browser()
+    url = 'mock://example.com'
+    mock_get(adapter, url=url, reply=form_page)
+    browser.open(url)
+    browser.select_form()
+    page = browser.page
+    form = browser.form
+
+    adapter.register_uri('POST', 'mock://example.com/post',
+                         exc=requests.ConnectionError)
+    with pytest.raises(requests.ConnectionError):
+        browser.submit_selected()
+
+    assert browser.url == url
+    assert browser.page is page
+    assert browser.form is form
+
+
+def test_refresh_failure_preserves_state():
+    """A refresh that fails to send must not modify the browser state,
+    and the page must remain refreshable afterwards."""
+    url = 'mock://example.com'
+    initial_page = BeautifulSoup('<p>Fake empty page</p>', 'lxml')
+    reload_page = BeautifulSoup('<p>Fake reloaded page</p>', 'lxml')
+    headers = {'Content-Type': 'text/html'}
+
+    browser, adapter = prepare_mock_browser()
+    adapter.register_uri('GET', url, [
+        {'text': str(initial_page), 'headers': headers},
+        {'exc': requests.ConnectionError},
+        {'text': str(reload_page), 'headers': headers},
+    ])
+    browser.open(url)
+
+    with pytest.raises(requests.ConnectionError):
+        browser.refresh()
+
+    assert browser.url == url
+    assert browser.page == initial_page
+
+    browser.refresh()
+    assert browser.url == url
+    assert browser.page == reload_page
+
+
 def test_requests_session_and_cookies(httpbin):
     """Check that the session object passed to the constructor of
     StatefulBrowser is actually taken into account."""

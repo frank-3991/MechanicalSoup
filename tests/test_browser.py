@@ -6,6 +6,7 @@ from unittest import mock
 
 import pytest
 import setpath  # noqa:F401, must come before 'import mechanicalsoup'
+import requests
 from bs4 import BeautifulSoup
 from requests.cookies import RequestsCookieJar
 from utils import mock_get, prepare_mock_browser
@@ -157,6 +158,49 @@ def test__request(httpbin):
 
     assert "application/x-www-form-urlencoded" in response.request.headers[
         "Content-Type"]
+
+
+def test_prepare_request_sends_nothing():
+    """_prepare_request only builds the request: nothing is sent until
+    _send_request is called, and then exactly one request is sent."""
+    form_html = (
+        '<form method="post" action="mock://form.com/post">'
+        '<input name="a" value="1"/>'
+        '<input name="b" value="2"/>'
+        '</form>'
+    )
+    form = BeautifulSoup(form_html, "lxml").form
+
+    browser, adapter = prepare_mock_browser()
+    adapter.register_uri('POST', 'mock://form.com/post', text='Success!')
+
+    request, send_kwargs = browser._prepare_request(form)
+    assert isinstance(request, requests.PreparedRequest)
+    assert adapter.request_history == []
+
+    response = browser._send_request(request, **send_kwargs)
+    assert response.status_code == 200
+    assert len(adapter.request_history) == 1
+    assert adapter.request_history[0].text == 'a=1&b=2'
+
+
+def test_request_construction_failure_sends_nothing():
+    """A failure while building the request guarantees that nothing
+    was sent."""
+    form_html = (
+        '<form method="post">'
+        '<input name="a" value="1"/>'
+        '</form>'
+    )
+    form = BeautifulSoup(form_html, "lxml").form
+
+    browser, adapter = prepare_mock_browser()
+    adapter.register_uri('POST', 'mock://form.com/post', text='Success!')
+
+    # The form has no action and no URL is given: construction fails.
+    with pytest.raises(ValueError, match="no URL to submit to"):
+        browser._request(form)
+    assert adapter.request_history == []
 
 
 valid_enctypes_file_submit = {"multipart/form-data": True,

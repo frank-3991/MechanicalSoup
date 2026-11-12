@@ -80,6 +80,13 @@ class Browser:
         re.IGNORECASE
     )
 
+    # Keyword arguments that control how a request is sent rather than
+    # how it is constructed. They are forwarded to
+    # `requests.Session.send`; everything else passed to the request
+    # helpers below is part of request construction.
+    _SEND_KWARGS = ("timeout", "allow_redirects", "stream", "verify",
+                    "cert", "proxies")
+
     @staticmethod
     def __looks_like_html(response: requests.Response) -> bool:
         """Guesses entity type when Content-Type header is missing.
@@ -342,6 +349,55 @@ class Browser:
 
         return cls._get_request_kwargs(method, url, files=files, **kwargs)
 
+    def _prepare_request(
+        self,
+        form,
+        url=None,
+        submit=None,
+        **kwargs,
+    ) -> tuple[requests.PreparedRequest, dict]:
+        """Build a prepared request from a form, without sending it.
+
+        This is the construction phase of :func:`_request`: all form
+        and parameter processing (and any error it may raise) happens
+        here, before anything is sent over the network.
+
+        :return: A tuple ``(request, send_kwargs)`` where ``request``
+            is a `requests.PreparedRequest` ready to be sent and
+            ``send_kwargs`` are the keyword arguments to forward to
+            :func:`_send_request`.
+        """
+        request_kwargs = self.get_request_kwargs(form, url, submit, **kwargs)
+        send_kwargs = {}
+        for key in self._SEND_KWARGS:
+            if key in request_kwargs:
+                send_kwargs[key] = request_kwargs.pop(key)
+        request = requests.Request(**request_kwargs)
+        return self.session.prepare_request(request), send_kwargs
+
+    def _send_request(self, request, **send_kwargs) -> requests.Response:
+        """Send a prepared request and return the response.
+
+        This is the sending phase of :func:`_request`. It can also be
+        used to (re)send a request prepared earlier, e.g. the
+        ``request`` attribute of a previous response. Environment and
+        session settings (proxies, TLS configuration, ...) are merged
+        in, exactly as `requests.Session.request` does, so a prepared
+        request sent through this method behaves identically to one
+        sent through `requests.Session.request`.
+        """
+        settings = self.session.merge_environment_settings(
+            request.url,
+            send_kwargs.pop("proxies", None) or {},
+            send_kwargs.pop("stream", None),
+            send_kwargs.pop("verify", None),
+            send_kwargs.pop("cert", None),
+        )
+        # Remaining arguments (e.g. timeout, allow_redirects) take
+        # precedence over environment and session settings.
+        settings.update(send_kwargs)
+        return self.session.send(request, **settings)
+
     def _request(
         self,
         form,
@@ -349,9 +405,16 @@ class Browser:
         submit=None,
         **kwargs,
     ) -> requests.Response:
-        """Extract input data from the form to pass to a Requests session."""
-        request_kwargs = self.get_request_kwargs(form, url, submit, **kwargs)
-        return self.session.request(**request_kwargs)
+        """Extract input data from the form and send it to the server.
+
+        The request is fully constructed (see :func:`_prepare_request`)
+        before anything is sent (see :func:`_send_request`), so a
+        failure while building the request guarantees that nothing was
+        sent.
+        """
+        request, send_kwargs = self._prepare_request(form, url, submit,
+                                                     **kwargs)
+        return self._send_request(request, **send_kwargs)
 
     def submit(
         self,

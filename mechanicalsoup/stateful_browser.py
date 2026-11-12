@@ -108,6 +108,19 @@ class StatefulBrowser(Browser):
         """Get the verbosity level. See :func:`set_verbose()`."""
         return self.__verbose
 
+    def __update_state(self, response):
+        """Set the browser state from a successfully retrieved response.
+
+        This is the only place where the browser state is replaced as a
+        result of a request. It must only be called once the response
+        has been fully retrieved: if request construction or sending
+        fails, the previous state is left untouched, so the current
+        page, its URL, the selected form and the last request all
+        remain available, e.g. for :func:`refresh`.
+        """
+        self.__state = _BrowserState(page=response.soup, url=response.url,
+                                     request=response.request)
+
     @property
     def page(self):
         """Get the current page as a soup object."""
@@ -163,8 +176,7 @@ class StatefulBrowser(Browser):
             print(url)
 
         resp = self.get(url, *args, **kwargs)
-        self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                     request=resp.request)
+        self.__update_state(resp)
         return resp
 
     def open_fake_page(self, page_text, url=None, soup_config=None):
@@ -200,10 +212,9 @@ class StatefulBrowser(Browser):
                              'page is opened or low-level browser methods '
                              'were used to do so')
 
-        resp = self.session.send(old_request)
+        resp = self._send_request(old_request)
         resp = Browser.add_soup(resp, self.soup_config)
-        self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                     request=resp.request)
+        self.__update_state(resp)
         return resp
 
     def select_form(self, selector="form", nr=0):
@@ -321,8 +332,7 @@ class StatefulBrowser(Browser):
             **kwargs,
         )
         if update_state:
-            self.__state = _BrowserState(page=resp.soup, url=resp.url,
-                                         request=resp.request)
+            self.__update_state(resp)
         return resp
 
     def list_links(self, *args, **kwargs):
