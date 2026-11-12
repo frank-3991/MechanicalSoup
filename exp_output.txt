@@ -1,0 +1,186 @@
+
+########## A. POST -> 200 HTML directly ##########
+
+--- STATE [A: after open /form] ---
+{
+  "label": "A: after open /form",
+  "browser.url": "http://127.0.0.1:64402/form",
+  "session.cookies": {
+    "sid": "FORM-1"
+  },
+  "saved_request": {
+    "method": "GET",
+    "url": "http://127.0.0.1:64402/form",
+    "cookie_header": null,
+    "body": null
+  }
+}
+
+--- STATE [A: after submit_selected (direct 200)] ---
+{
+  "label": "A: after submit_selected (direct 200)",
+  "browser.url": "http://127.0.0.1:64402/submit-direct",
+  "session.cookies": {
+    "sid": "AFTER-DIRECT"
+  },
+  "saved_request": {
+    "method": "POST",
+    "url": "http://127.0.0.1:64402/submit-direct",
+    "cookie_header": "sid=FORM-1",
+    "body": "item=widget"
+  }
+}
+
+=== WRITES after A submit: 1 ===
+  seq=2 POST /submit-direct cookie=sid=FORM-1 body=item=widget
+refresh() now replays the saved request:
+
+--- STATE [A: after refresh] ---
+{
+  "label": "A: after refresh",
+  "browser.url": "http://127.0.0.1:64402/submit-direct",
+  "session.cookies": {
+    "sid": "AFTER-DIRECT"
+  },
+  "saved_request": {
+    "method": "POST",
+    "url": "http://127.0.0.1:64402/submit-direct",
+    "cookie_header": "sid=FORM-1",
+    "body": "item=widget"
+  }
+}
+
+=== WRITES after A refresh: 2 ===
+  seq=2 POST /submit-direct cookie=sid=FORM-1 body=item=widget
+  seq=3 POST /submit-direct cookie=sid=FORM-1 body=item=widget
+  server saw seq=2 POST /submit-direct cookie=sid=FORM-1 body=item=widget [write]
+  server saw seq=3 POST /submit-direct cookie=sid=FORM-1 body=item=widget [write]
+
+########## B. POST -> 303 redirect ##########
+
+--- STATE [B: after submit_selected (303)] ---
+{
+  "label": "B: after submit_selected (303)",
+  "browser.url": "http://127.0.0.1:64402/result303",
+  "session.cookies": {
+    "sid": "AFTER-303"
+  },
+  "saved_request": {
+    "method": "GET",
+    "url": "http://127.0.0.1:64402/result303",
+    "cookie_header": "sid=AFTER-303",
+    "body": null
+  }
+}
+
+--- STATE [B: after refresh] ---
+{
+  "label": "B: after refresh",
+  "browser.url": "http://127.0.0.1:64402/result303",
+  "session.cookies": {
+    "sid": "AFTER-303"
+  },
+  "saved_request": {
+    "method": "GET",
+    "url": "http://127.0.0.1:64402/result303",
+    "cookie_header": "sid=AFTER-303",
+    "body": null
+  }
+}
+writes delta from refresh: 0
+  server saw seq=6 GET /result303 cookie=sid=AFTER-303 body= [result]
+  server saw seq=7 GET /result303 cookie=sid=AFTER-303 body= [result]
+
+########## C. POST -> 307 redirect ##########
+
+--- STATE [C: after submit_selected (307)] ---
+{
+  "label": "C: after submit_selected (307)",
+  "browser.url": "http://127.0.0.1:64402/write307",
+  "session.cookies": {
+    "sid": "AFTER-307"
+  },
+  "saved_request": {
+    "method": "POST",
+    "url": "http://127.0.0.1:64402/write307",
+    "cookie_header": "sid=AFTER-307",
+    "body": "item=widget"
+  }
+}
+
+--- STATE [C: after refresh] ---
+{
+  "label": "C: after refresh",
+  "browser.url": "http://127.0.0.1:64402/write307",
+  "session.cookies": {
+    "sid": "AFTER-307"
+  },
+  "saved_request": {
+    "method": "POST",
+    "url": "http://127.0.0.1:64402/write307",
+    "cookie_header": "sid=AFTER-307",
+    "body": "item=widget"
+  }
+}
+writes delta from refresh: 1
+
+=== WRITES after C refresh: 5 ===
+  seq=2 POST /submit-direct cookie=sid=FORM-1 body=item=widget
+  seq=3 POST /submit-direct cookie=sid=FORM-1 body=item=widget
+  seq=5 POST /submit-303 cookie=sid=FORM-1 body=item=widget
+  seq=10 POST /write307 cookie=sid=AFTER-307 body=item=widget
+  seq=11 POST /write307 cookie=sid=AFTER-307 body=item=widget
+
+########## D. Re-submit selected form (303 endpoint) ##########
+writes delta from re-submit: 1
+  server saw seq=15 POST /submit-303 cookie=sid=AFTER-303 body=item=widget [write]
+  server saw seq=16 GET /result303 cookie=sid=AFTER-303 body= [result]
+
+########## E. submit_selected(update_state=False) ##########
+
+--- STATE [E: after submit update_state=False] ---
+{
+  "label": "E: after submit update_state=False",
+  "browser.url": "http://127.0.0.1:64402/form",
+  "session.cookies": {
+    "sid": "AFTER-DIRECT"
+  },
+  "saved_request": {
+    "method": "GET",
+    "url": "http://127.0.0.1:64402/form",
+    "cookie_header": null,
+    "body": null
+  }
+}
+writes delta from refresh: 0
+  server saw seq=18 POST /submit-direct cookie=sid=FORM-1 body=item=widget [write]
+  server saw seq=19 GET /form cookie=None body= [get-form]
+
+########## F. Cookie: saved request vs current jar ##########
+jar now: {'sid': 'AFTER-DIRECT'}
+saved request Cookie header: sid=FORM-1
+server then saw on refresh:
+  server saw seq=22 POST /submit-direct cookie=sid=FORM-1 body=item=widget [write]
+
+########## G. Write accepted, response lost ##########
+client got ConnectionError: ConnectionError
+writes delta: 1 (server accepted the write although client saw only an error)
+
+--- STATE [G: after failed submit] ---
+{
+  "label": "G: after failed submit",
+  "browser.url": "http://127.0.0.1:64402/form",
+  "session.cookies": {
+    "sid": "FORM-1"
+  },
+  "saved_request": {
+    "method": "GET",
+    "url": "http://127.0.0.1:64402/form",
+    "cookie_header": null,
+    "body": null
+  }
+}
+
+########## H. After close() ##########
+page still readable: True | url still: True | session: None
+refresh() after close() -> AttributeError: 'NoneType' object has no attribute 'send'
